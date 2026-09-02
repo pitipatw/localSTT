@@ -1,0 +1,14 @@
+# One term per line. Lines starting with # are ignored.
+# Add with: dictate jargon "Term"
+Pop!_OS
+COSMIC
+Wayland
+ydotool
+Voxtype
+Parakeet
+Ollama
+Qwen3
+PipeWire
+Kubernetes
+Terraform
+PyTorch

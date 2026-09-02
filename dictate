@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""dictate — companion CLI for the local dictation setup.
+
+  dictate fix "<heard>" "<intended>"     teach a spelling (corrections.json)
+  dictate unfix "<heard>"                remove a correction
+  dictate snippet "<trigger>" "<text>"   add a snippet (snippets.json)
+  dictate jargon "<term>" [...]          add terms to jargon.txt
+  dictate list                           show corrections, snippets, jargon
+  dictate test "<raw text>"              run polish.py on text (uses Ollama if running)
+  dictate log tail [N]                   last N log lines (default 10)
+  dictate log stats                      latency / LLM-usage summary
+  dictate app "<app_id>"                 write app_id hint (for external focus helpers)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import polish  # noqa: E402
+
+
+def _load(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+                    encoding="utf-8")
+
+
+def cmd_fix(args):
+    if len(args) != 2:
+        die('usage: dictate fix "<heard>" "<intended>"')
+    p = polish.config_dir() / "corrections.json"
+    d = _load(p)
+    d[args[0].strip().lower()] = args[1].strip()
+    _save(p, d)
+    print(f"ok: '{args[0]}' -> '{args[1]}' ({len(d)} corrections)")
+
+
+def cmd_unfix(args):
+    p = polish.config_dir() / "corrections.json"
+    d = _load(p)
+    if d.pop(args[0].strip().lower(), None) is None:
+        die(f"no correction for '{args[0]}'")
+    _save(p, d)
+    print("ok")
+
+
+def cmd_snippet(args):
+    if len(args) != 2:
+        die('usage: dictate snippet "<trigger>" "<text>"')
+    p = polish.config_dir() / "snippets.json"
+    d = _load(p)
+    d[args[0].strip().lower()] = args[1]
+    _save(p, d)
+    print(f"ok: snippet '{args[0]}' ({len(d)} snippets)")
+
+
+def cmd_jargon(args):
+    if not args:
+        die('usage: dictate jargon "<term>" [...]')
+    p = polish.config_dir() / "jargon.txt"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = set(p.read_text(encoding="utf-8").split("\n")) if p.exists() else set()
+    with p.open("a", encoding="utf-8") as f:
+        for term in args:
+            if term not in existing:
+                f.write(term + "\n")
+    print("ok")
+
+
+def cmd_list(_args):
+    cfg = polish.Config.load()
+    print("corrections:")
+    for k, v in sorted(cfg.corrections.items()):
+        print(f"  {k!r} -> {v!r}")
+    print("snippets:")
+    for k, v in sorted(cfg.snippets.items()):
+        print(f"  {k!r} -> {v[:60]!r}")
+    print("jargon:", ", ".join(cfg.jargon) or "(none)")
+    print("model:", cfg.settings["model"])
+
+
+def cmd_test(args):
+    if not args:
+        die('usage: dictate test "<raw text>"')
+    cfg = polish.Config.load()
+    r = polish.polish(" ".join(args), cfg, app_id=polish.current_app_id(cfg))
+    print(f"[{r.reason}] corrected: {r.corrected}")
+    print(f"final: {r.final}")
+
+
+def cmd_log(args):
+    sub = args[0] if args else "tail"
+    p = polish.log_path()
+    if not p.exists():
+        die(f"no log at {p}")
+    lines = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if sub == "tail":
+        n = int(args[1]) if len(args) > 1 else 10
+        for e in lines[-n:]:
+            print(f"{e['ts']}  {e['latency_ms']:5d}ms  {e['reason']:<14} {e['final']!r}")
+    elif sub == "stats":
+        subprocess.run([sys.executable, str(HERE / "tests" / "latency_report.py"), str(p)], check=False)
+    else:
+        die("usage: dictate log tail [N] | dictate log stats")
+
+
+def cmd_app(args):
+    p = polish.config_dir() / "app_id"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text((args[0] if args else "unknown") + "\n", encoding="utf-8")
+
+
+COMMANDS = {
+    "fix": cmd_fix, "unfix": cmd_unfix, "snippet": cmd_snippet, "jargon": cmd_jargon,
+    "list": cmd_list, "test": cmd_test, "log": cmd_log, "app": cmd_app,
+}
+
+
+def die(msg: str) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in COMMANDS:
+        print(__doc__.strip())
+        return 0 if argv and argv[0] in ("-h", "--help") else 2
+    COMMANDS[argv[0]](argv[1:])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
