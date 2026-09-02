@@ -51,6 +51,11 @@ DEFAULT_SETTINGS = {
     "max_growth": 0.30,   # final may be at most 30% longer than input
     "max_shrink": 0.75,   # final may lose at most 75% of the input's characters
     "app_id_max_age_s": 5.0,
+    # Privacy: the log stores every dictation in plaintext so you can tune the
+    # dictionary and prompt. Set log_text=false to keep only metadata, or
+    # log_enabled=false for no log at all. `dictate log purge` deletes it.
+    "log_enabled": True,
+    "log_text": True,
 }
 
 # app_id substring (lower-cased) -> style key used in prompt.md
@@ -276,21 +281,27 @@ def polish(raw: str, cfg: Config, previous: str = "", app_id: str = "unknown",
     return Result(raw, corrected, out, app_id, True, "llm")
 
 
-def append_log(result: Result, latency_ms: int, path: Path | None = None) -> None:
+def append_log(result: Result, latency_ms: int, settings: dict, path: Path | None = None) -> None:
+    """One JSON line per dictation, owner-readable only. Text fields are included
+    only when settings["log_text"] is true."""
+    if not settings.get("log_enabled", True):
+        return
     p = path or log_path()
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "app_id": result.app_id,
+        "llm_used": result.llm_used,
+        "reason": result.reason,
+        "latency_ms": latency_ms,
+        "words": word_count(result.raw),
+    }
+    if settings.get("log_text", True):
+        entry.update(raw=result.raw, corrected=result.corrected, final=result.final)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "app_id": result.app_id,
-                "raw": result.raw,
-                "corrected": result.corrected,
-                "final": result.final,
-                "llm_used": result.llm_used,
-                "reason": result.reason,
-                "latency_ms": latency_ms,
-            }, ensure_ascii=False) + "\n")
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError:
         pass  # logging must never break dictation
 
@@ -298,8 +309,10 @@ def append_log(result: Result, latency_ms: int, path: Path | None = None) -> Non
 def main() -> int:
     t0 = time.monotonic()
     raw = sys.stdin.read()
+    settings = dict(DEFAULT_SETTINGS)
     try:
         cfg = Config.load()
+        settings = cfg.settings
         app_id = current_app_id(cfg)
         result = polish(raw, cfg, previous=os.environ.get("VOXTYPE_CONTEXT", ""), app_id=app_id)
         final = result.final
@@ -308,7 +321,7 @@ def main() -> int:
         final = normalize(raw)
     sys.stdout.write(final)
     sys.stdout.flush()
-    append_log(result, int((time.monotonic() - t0) * 1000))
+    append_log(result, int((time.monotonic() - t0) * 1000), settings)
     return 0
 
 

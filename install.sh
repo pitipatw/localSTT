@@ -2,47 +2,73 @@
 # Idempotent installer for the local dictation stack on Pop!_OS COSMIC (Wayland).
 # Re-run freely; every step checks before it acts and ends with a verification.
 #
-#   ./install.sh            run all steps
-#   ./install.sh --list     show step names
-#   ./install.sh <step>...  run only the named steps (e.g. ./install.sh voxtype model)
+#   ./install.sh                      run all steps (push-to-talk, needs `input` group)
+#   HOTKEY_MODE=toggle ./install.sh   toggle mode: no `input` group, hotkey via COSMIC shortcut
+#   ./install.sh --list               show step names
+#   ./install.sh <step>...            run only the named steps (e.g. ./install.sh voxtype model)
 #
-# Steps that need sudo will prompt. Steps that need a re-login say so and keep going.
+# Security posture (see INSTALL.md):
+#   * Nothing is piped from the network into a shell. Binaries are pinned to the
+#     versions below and checked against the publisher's SHA256 list; Voxtype's
+#     list is also GPG-verified when gpg is available.
+#   * The only privileged actions are apt installs, the udev rule, group membership,
+#     and installing Ollama under /usr/local with its own system user.
 
 set -euo pipefail
 
+# ---- pinned versions -------------------------------------------------------
+VOXTYPE_VERSION="1.0.1"
+VOXTYPE_GPG_KEY="9CCF7915B750CAE8B095ED1AA3FC9F33FD209279"   # from the release notes
+OLLAMA_VERSION="0.33.2"
+OLLAMA_MODEL="qwen3:8b"
+PARAKEET_REPO="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
+# ---------------------------------------------------------------------------
+
+HOTKEY_MODE="${HOTKEY_MODE:-push_to_talk}"     # push_to_talk | toggle
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/.local/bin"
+VOX_LIB="$HOME/.local/lib/voxtype"
 DICTATE_DIR="$HOME/.config/dictate"
 VOX_CFG_DIR="$HOME/.config/voxtype"
 MODEL_DIR="$HOME/.local/share/voxtype/models/parakeet-tdt-0.6b-v3"
-HF_REPO="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
-OLLAMA_MODEL="qwen3:8b"
+LOG_DIR="$HOME/.local/share/dictate"
+DL="$HOME/.cache/localtts-downloads"
 NEED_RELOGIN=0
+mkdir -p "$DL"
 
 bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()    { printf '  \033[32m✔\033[0m %s\n' "$*"; }
 warn()  { printf '  \033[33m!\033[0m %s\n' "$*"; }
 fail()  { printf '  \033[31m✘\033[0m %s\n' "$*"; exit 1; }
 step()  { echo; bold "== $1"; }
+fetch() { # fetch <url> <dest>  (skips if dest exists and is non-empty)
+  [[ -s "$2" ]] && return 0
+  curl -fL --progress-bar --retry 3 -o "$2.part" "$1" && mv "$2.part" "$2"
+}
+
+case "$HOTKEY_MODE" in
+  push_to_talk) UINPUT_GROUP=input ;;
+  toggle)       UINPUT_GROUP=uinput ;;
+  *) fail "HOTKEY_MODE must be push_to_talk or toggle" ;;
+esac
 
 # ----------------------------------------------------------------------------
 step_preflight() {
-  step "preflight"
+  step "preflight  (mode: $HOTKEY_MODE, uinput group: $UINPUT_GROUP)"
   [[ "$(uname -m)" == "x86_64" ]] || fail "expected x86_64"
   command -v nvidia-smi >/dev/null || fail "nvidia-smi missing — install the NVIDIA driver first"
-  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/  /'
+  nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | sed 's/^/  /'
   if command -v pactl >/dev/null && pactl info 2>/dev/null | grep -qi pipewire; then
     ok "audio server is PipeWire"
   else
-    warn "could not confirm PipeWire (pactl info) — Voxtype may still work via ALSA/Pulse"
+    warn "could not confirm PipeWire (pactl info)"
   fi
   [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] && ok "Wayland session" || warn "XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset} (expected wayland)"
-  echo "  keyboard layout: $(localectl status 2>/dev/null | grep -i 'x11 layout' | awk '{print $NF}' || echo unknown)  (irrelevant with paste_keys=shift+insert)"
 }
 
 step_apt() {
   step "apt packages"
-  local pkgs=(ydotool wl-clipboard curl jq python3 python3-pytest)
+  local pkgs=(ydotool wl-clipboard curl jq zstd gnupg python3 python3-pytest)
   local missing=()
   for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
   if ((${#missing[@]})); then
@@ -53,15 +79,22 @@ step_apt() {
 }
 
 step_ydotool() {
-  step "ydotool / uinput"
-  if id -nG "$USER" | grep -qw input; then
-    ok "$USER is in group input"
-  else
-    sudo usermod -aG input "$USER"; NEED_RELOGIN=1
-    warn "added $USER to group input — takes effect after logout/login"
+  step "ydotool / uinput  (group: $UINPUT_GROUP)"
+  if [[ $UINPUT_GROUP == uinput ]] && ! getent group uinput >/dev/null; then
+    sudo groupadd --system uinput; ok "created group uinput"
   fi
+  if id -nG "$USER" | grep -qw "$UINPUT_GROUP"; then
+    ok "$USER is in group $UINPUT_GROUP"
+  else
+    sudo usermod -aG "$UINPUT_GROUP" "$USER"; NEED_RELOGIN=1
+    warn "added $USER to group $UINPUT_GROUP — takes effect after logout/login"
+  fi
+  if [[ $UINPUT_GROUP == uinput ]] && id -nG "$USER" | grep -qw input; then
+    warn "$USER is ALSO in group 'input' (keyboard read access). Toggle mode does not need it: sudo gpasswd -d $USER input"
+  fi
+
   local rule=/etc/udev/rules.d/80-uinput.rules
-  local want='KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"'
+  local want="KERNEL==\"uinput\", GROUP=\"$UINPUT_GROUP\", MODE=\"0660\", OPTIONS+=\"static_node=uinput\""
   if [[ -f $rule ]] && grep -qF "$want" "$rule"; then
     ok "udev rule present"
   else
@@ -70,10 +103,9 @@ step_ydotool() {
     ok "udev rule written"
   fi
   sudo modprobe uinput 2>/dev/null || true
-  grep -q '^uinput$' /etc/modules-load.d/*.conf 2>/dev/null || echo uinput | sudo tee /etc/modules-load.d/uinput.conf >/dev/null
+  grep -qs '^uinput$' /etc/modules-load.d/*.conf || echo uinput | sudo tee /etc/modules-load.d/uinput.conf >/dev/null
   ls -l /dev/uinput | sed 's/^/  /'
 
-  # user daemon: use the distro unit if it exists, else ours
   mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/environment.d"
   if ! systemctl --user cat ydotool >/dev/null 2>&1; then
     cp "$REPO/systemd/ydotool.service" "$HOME/.config/systemd/user/ydotool.service"
@@ -82,72 +114,146 @@ step_ydotool() {
   else
     ok "ydotool user unit already available"
   fi
-  systemctl --user enable --now ydotool
+  systemctl --user enable ydotool >/dev/null 2>&1 || true
+  systemctl --user restart ydotool || true
   sleep 0.5
   local sock
   sock=$(systemctl --user show ydotool -p ExecStart --value | grep -o -- '--socket-path=[^ ]*' | cut -d= -f2 || true)
   sock="${sock//%t/$XDG_RUNTIME_DIR}"
-  [[ -z $sock ]] && sock="/tmp/.ydotool_socket"   # distro default
+  [[ -z $sock ]] && sock="/tmp/.ydotool_socket"
   echo "YDOTOOL_SOCKET=$sock" > "$HOME/.config/environment.d/ydotool.conf"
   grep -q YDOTOOL_SOCKET "$HOME/.profile" 2>/dev/null || echo "export YDOTOOL_SOCKET=\"$sock\"" >> "$HOME/.profile"
   export YDOTOOL_SOCKET="$sock"
-  systemctl --user is-active ydotool >/dev/null && ok "ydotoold running, socket $sock" || fail "ydotoold not running: journalctl --user -u ydotool"
-  [[ -S $sock ]] && ok "socket exists" || warn "socket $sock not found yet (re-login may be needed)"
+  if systemctl --user is-active ydotool >/dev/null; then
+    ok "ydotoold running, socket $sock"
+  elif ((NEED_RELOGIN)); then
+    warn "ydotoold cannot open /dev/uinput until you log out and back in — expected on first run; continuing"
+  else
+    journalctl --user -u ydotool -n 10 --no-pager | sed 's/^/  /'
+    fail "ydotoold not running (see log above). Check: id -nG | grep $UINPUT_GROUP ; ls -l /dev/uinput ; which ydotoold"
+  fi
 }
 
 step_ollama() {
-  step "Ollama + $OLLAMA_MODEL"
-  if ! command -v ollama >/dev/null; then
-    curl -fsSL https://ollama.com/install.sh | sh
+  step "Ollama $OLLAMA_VERSION + $OLLAMA_MODEL  (pinned tarball, sha256-verified, no curl|sh)"
+  if ! command -v ollama >/dev/null || [[ "$(ollama --version 2>/dev/null | grep -o '[0-9.]*$')" != "$OLLAMA_VERSION" ]]; then
+    local base="https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION"
+    fetch "$base/ollama-linux-amd64.tar.zst" "$DL/ollama-$OLLAMA_VERSION.tar.zst"
+    fetch "$base/sha256sum.txt"              "$DL/ollama-$OLLAMA_VERSION.sha256sum.txt"
+    local want have
+    want=$(grep ' ollama-linux-amd64.tar.zst$' "$DL/ollama-$OLLAMA_VERSION.sha256sum.txt" | awk '{print $1}')
+    have=$(sha256sum "$DL/ollama-$OLLAMA_VERSION.tar.zst" | awk '{print $1}')
+    [[ -n $want && $want == "$have" ]] || fail "ollama tarball checksum mismatch (want $want, have $have) — delete $DL/ollama-* and retry"
+    ok "sha256 verified"
+    sudo tar -C /usr/local --zstd -xf "$DL/ollama-$OLLAMA_VERSION.tar.zst"
+    ok "installed to /usr/local/bin/ollama"
+  else
+    ok "ollama $OLLAMA_VERSION present"
   fi
-  ok "ollama $(ollama --version 2>/dev/null | head -1)"
-  systemctl is-active ollama >/dev/null 2>&1 || sudo systemctl enable --now ollama || true
+  if ! id ollama >/dev/null 2>&1; then
+    sudo useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+  fi
+  if [[ ! -f /etc/systemd/system/ollama.service ]]; then
+    sudo tee /etc/systemd/system/ollama.service >/dev/null <<'EOF'
+[Unit]
+Description=Ollama (local LLM server)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+Environment="HOME=/usr/share/ollama"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+  fi
+  sudo systemctl enable --now ollama
+  sleep 1
+  ss -ltn | grep -q '127.0.0.1:11434' && ok "listening on 127.0.0.1:11434 only" || warn "ollama not (yet) listening on 127.0.0.1:11434 — check: sudo journalctl -u ollama -n 20"
   ollama list 2>/dev/null | grep -q "^${OLLAMA_MODEL}" || ollama pull "$OLLAMA_MODEL"
   local t0 t1 resp
   t0=$(date +%s%N)
-  resp=$(curl -s http://localhost:11434/api/chat -d "{\"model\":\"$OLLAMA_MODEL\",\"think\":false,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}]}")
+  resp=$(curl -s http://127.0.0.1:11434/api/chat -d "{\"model\":\"$OLLAMA_MODEL\",\"think\":false,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}]}")
   t1=$(date +%s%N)
-  echo "$resp" | jq -r '.message.content' | grep -qi ok && ok "model answers ($(( (t1-t0)/1000000 )) ms, first call includes load)" || fail "unexpected reply: $resp"
+  echo "$resp" | jq -r '.message.content' | grep -qi ok && ok "model answers ($(( (t1-t0)/1000000 )) ms incl. first load)" || fail "unexpected reply: $resp"
 }
 
 step_voxtype() {
-  step "Voxtype (ONNX+CUDA build)"
-  if command -v voxtype >/dev/null; then
-    ok "already installed: $(voxtype --version 2>/dev/null | head -1)"
-    return
-  fi
-  local api="https://api.github.com/repos/peteonrails/voxtype/releases/latest"
-  local url
-  url=$(curl -fsSL "$api" | jq -r '.assets[].browser_download_url' | grep -i 'onnx-cuda' | grep -i 'x86_64\|amd64' | grep -i '\.deb$' | head -1 || true)
-  if [[ -n $url ]]; then
-    echo "  downloading $url"
-    curl -fL -o /tmp/voxtype.deb "$url"
-    sudo apt-get install -y /tmp/voxtype.deb
+  step "Voxtype $VOXTYPE_VERSION  (onnx-cuda binary, sha256 + GPG verified)"
+  if [[ -x "$VOX_LIB/voxtype" ]] && "$VOX_LIB/voxtype" --version 2>/dev/null | grep -q "$VOXTYPE_VERSION"; then
+    ok "already installed: $("$VOX_LIB/voxtype" --version | head -1)"
   else
-    url=$(curl -fsSL "$api" | jq -r '.assets[].browser_download_url' | grep -i 'onnx-cuda' | grep -i 'x86_64' | grep -i 'appimage' | head -1 || true)
-    [[ -n $url ]] || fail "no onnx-cuda x86_64 asset found in latest release — open https://github.com/peteonrails/voxtype/releases and install manually"
-    mkdir -p "$BIN"; curl -fL -o "$BIN/voxtype" "$url"; chmod +x "$BIN/voxtype"
+    # cuda-13 build needs a driver that reports CUDA >= 13; otherwise cuda-12.
+    local cuda_major variant
+    cuda_major=$(nvidia-smi | grep -o 'CUDA Version: [0-9]*' | grep -o '[0-9]*$' || echo 12)
+    variant=$(( cuda_major >= 13 ? 13 : 12 ))
+    local base="https://github.com/peteonrails/voxtype/releases/download/v$VOXTYPE_VERSION"
+    local stem="voxtype-$VOXTYPE_VERSION-linux-x86_64-onnx-cuda-$variant"
+    local files=("$stem" "$stem.libonnxruntime_providers_cuda.so" "$stem.libonnxruntime_providers_shared.so")
+    [[ $variant == 13 ]] && files+=("$stem.libonnxruntime.so.1.24.4")
+    echo "  variant: cuda-$variant (driver reports CUDA $cuda_major)"
+    fetch "$base/SHA256SUMS.txt"     "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt"
+    fetch "$base/SHA256SUMS.txt.asc" "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt.asc"
+    if command -v gpg >/dev/null; then
+      gpg --list-keys "$VOXTYPE_GPG_KEY" >/dev/null 2>&1 || gpg --keyserver hkps://keys.openpgp.org --recv-keys "$VOXTYPE_GPG_KEY" \
+        || warn "could not fetch signing key from keys.openpgp.org"
+      if gpg --verify "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt.asc" "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt" 2>/dev/null; then
+        ok "SHA256SUMS.txt signature valid ($VOXTYPE_GPG_KEY)"
+      else
+        warn "GPG verification failed or key unavailable — falling back to sha256 only. Verify manually: gpg --verify $DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt.asc"
+      fi
+    fi
+    local f
+    for f in "${files[@]}"; do fetch "$base/$f" "$DL/$f"; done
+    ( cd "$DL" && grep -E " ($(IFS='|'; echo "${files[*]}"))$" "voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt" | sha256sum --check --strict ) \
+      | sed 's/^/  /' || fail "sha256 mismatch — delete $DL/voxtype-* and retry, or the release was tampered with"
+    ok "sha256 verified for ${#files[@]} files"
+    mkdir -p "$VOX_LIB" "$BIN"
+    install -m 0755 "$DL/$stem" "$VOX_LIB/voxtype"
+    for f in "${files[@]:1}"; do install -m 0644 "$DL/$f" "$VOX_LIB/${f#"$stem".}"; done
+    ok "installed to $VOX_LIB"
   fi
-  command -v voxtype >/dev/null && ok "installed $(voxtype --version 2>/dev/null | head -1)" || fail "voxtype not on PATH (is ~/.local/bin in PATH?)"
+  # wrapper so the CUDA provider .so files (and system CUDA/cuDNN libs) are found
+  cat > "$BIN/voxtype" <<EOF
+#!/usr/bin/env bash
+export LD_LIBRARY_PATH="$VOX_LIB:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+exec "$VOX_LIB/voxtype" "\$@"
+EOF
+  chmod +x "$BIN/voxtype"
+  command -v voxtype >/dev/null || fail "$BIN is not on PATH — add it and re-run"
+  ok "$(voxtype --version 2>/dev/null | head -1)"
+  if ldconfig -p | grep -q 'libcudnn.so.9'; then
+    ok "cuDNN 9 found (CUDA execution provider can load)"
+  else
+    warn "libcudnn.so.9 not found — Parakeet will run on CPU until cuDNN 9 + CUDA runtime libs are installed"
+    warn "  Pop!_OS: sudo apt install system76-cudnn-12.x  (or NVIDIA's libcudnn9-cuda-12); see INSTALL.md §GPU"
+  fi
 }
 
 step_model() {
-  step "Parakeet TDT 0.6B v3 (ONNX)"
+  step "Parakeet TDT 0.6B v3 (ONNX, data-only format)"
   mkdir -p "$MODEL_DIR"
   local f
   for f in encoder-model.onnx encoder-model.onnx.data decoder_joint-model.onnx vocab.txt config.json; do
     if [[ -s "$MODEL_DIR/$f" ]]; then ok "$f"; else
-      echo "  fetching $f"
-      curl -fL --progress-bar -o "$MODEL_DIR/$f" "$HF_REPO/$f"
+      echo "  fetching $f"; fetch "$PARAKEET_REPO/$f" "$MODEL_DIR/$f"
     fi
   done
   du -sh "$MODEL_DIR" | sed 's/^/  /'
 }
 
 step_config() {
-  step "config + hooks"
-  mkdir -p "$BIN" "$DICTATE_DIR" "$VOX_CFG_DIR"
-  chmod +x "$REPO/polish.py" "$REPO/dictate"
+  step "config + hooks  (mode: $HOTKEY_MODE)"
+  mkdir -p "$BIN" "$DICTATE_DIR" "$VOX_CFG_DIR" "$LOG_DIR"
+  chmod 700 "$DICTATE_DIR" "$LOG_DIR"
+  chmod +x "$REPO/polish.py" "$REPO/dictate" "$REPO/tests/latency_report.py"
   ln -sfn "$REPO/polish.py" "$BIN/polish.py"
   ln -sfn "$REPO/dictate"   "$BIN/dictate"
   ok "symlinked polish.py and dictate into $BIN"
@@ -155,33 +261,53 @@ step_config() {
   for f in prompt.md corrections.json snippets.json jargon.txt settings.json; do
     if [[ -e "$DICTATE_DIR/$f" ]]; then ok "$f exists (kept)"; else cp "$REPO/config/$f" "$DICTATE_DIR/$f"; ok "$f installed"; fi
   done
+  local src="$REPO/config/voxtype.config.toml"
+  [[ $HOTKEY_MODE == toggle ]] && src="$REPO/config/voxtype.config.toggle.toml"
   local cfg="$VOX_CFG_DIR/config.toml"
-  if [[ -e $cfg ]] && ! cmp -s "$cfg" "$REPO/config/voxtype.config.toml"; then
+  if [[ -e $cfg ]] && ! sed "s#/home/pitipatw#$HOME#g" "$src" | cmp -s - "$cfg"; then
     cp "$cfg" "$cfg.bak.$(date +%s)"; warn "existing config.toml backed up"
   fi
-  sed "s#/home/pitipatw#$HOME#g" "$REPO/config/voxtype.config.toml" > "$cfg"
+  sed "s#/home/pitipatw#$HOME#g" "$src" > "$cfg"
+  chmod 600 "$cfg"
   ok "wrote $cfg"
   printf 'um so uh this is a test of the polish hook with enough words' | "$BIN/polish.py" >/dev/null && ok "polish.py runs end to end (see: dictate log tail 1)"
+  [[ -f "$LOG_DIR/log.jsonl" ]] && { chmod 600 "$LOG_DIR/log.jsonl"; ok "log.jsonl is mode 600"; }
 }
 
 step_service() {
   step "voxtype daemon"
   voxtype setup || warn "voxtype setup reported issues (see above)"
   voxtype setup systemd || warn "voxtype setup systemd failed — run it manually"
+  # drop-in so the daemon (started by systemd, not through the wrapper) finds the CUDA
+  # provider libraries and the ydotool socket
+  mkdir -p "$HOME/.config/systemd/user/voxtype.service.d"
+  cat > "$HOME/.config/systemd/user/voxtype.service.d/override.conf" <<EOF
+[Service]
+Environment="LD_LIBRARY_PATH=$VOX_LIB:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+Environment="YDOTOOL_SOCKET=${YDOTOOL_SOCKET:-$XDG_RUNTIME_DIR/.ydotool_socket}"
+Environment="PATH=$BIN:/usr/local/bin:/usr/bin:/bin"
+EOF
+  systemctl --user daemon-reload
   systemctl --user enable --now voxtype 2>/dev/null || warn "could not enable voxtype unit"
+  systemctl --user restart voxtype 2>/dev/null || true
   sleep 2
   systemctl --user is-active voxtype >/dev/null && ok "voxtype running" || warn "voxtype not active: journalctl --user -u voxtype -f"
+  if [[ $HOTKEY_MODE == toggle ]]; then
+    warn "toggle mode: add a COSMIC custom shortcut (Settings → Keyboard → Custom shortcuts):"
+    warn "    command: $BIN/voxtype record toggle     key: your choice (e.g. Super+Space)"
+  fi
 }
 
 step_summary() {
   step "next: manual checks"
   cat <<EOF
-  1. $( ((NEED_RELOGIN)) && echo "LOG OUT AND BACK IN (input group), then re-run: ./install.sh ydotool service" || echo "no re-login needed" )
-  2. Clipboard paste probe: echo hello | wl-copy; focus an editor; sleep 3 && ydotool key shift+insert
-  3. Hold RIGHT CTRL, say "testing one two three", release → text appears in the focused box
-  4. dictate test "send it monday actually delete that send it friday"
-  5. Latency: after ~20 dictations run: dictate log stats
-  Logs: journalctl --user -u voxtype -f   |   ~/.local/share/dictate/log.jsonl
+  1. $( ((NEED_RELOGIN)) && echo "LOG OUT AND BACK IN (new group membership), then re-run: ./install.sh" || echo "no re-login needed" )
+  2. Paste probe:  echo hello | wl-copy; focus an editor; sleep 3 && ydotool key shift+insert
+  3. LLM probe:    dictate test "send it monday actually delete that send it friday"
+  4. Mic probe:    $( [[ $HOTKEY_MODE == toggle ]] && echo "press your toggle shortcut, say 'testing one two three', press again" || echo "hold RIGHT CTRL, say 'testing one two three', release" ) → text appears
+  5. Mic-in-use check: run  pw-top  and confirm a voxtype capture stream exists ONLY while recording
+  6. After ~20 dictations: dictate log stats
+  Logs: journalctl --user -u voxtype -f   |   dictate log tail   |   dictate log purge
 EOF
 }
 

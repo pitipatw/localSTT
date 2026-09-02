@@ -164,8 +164,33 @@ def test_u10_end_to_end_logs_one_line(cfgdir, tmp_path):
     lines = log.read_text().splitlines()
     assert len(lines) == 1
     entry = json.loads(lines[0])
-    assert set(entry) == {"ts", "app_id", "raw", "corrected", "final", "llm_used", "reason", "latency_ms"}
+    assert set(entry) == {"ts", "app_id", "raw", "corrected", "final", "llm_used", "reason",
+                          "latency_ms", "words"}
     assert entry["llm_used"] is False and entry["reason"].startswith("llm_error")
+    assert oct(log.stat().st_mode & 0o777) == "0o600"
+
+
+def test_log_text_off_keeps_only_metadata(cfgdir, tmp_path):
+    log = tmp_path / "log.jsonl"
+    s = json.loads((cfgdir / "settings.json").read_text())
+    s.update({"log_text": False, "min_words_for_llm": 100})
+    (cfgdir / "settings.json").write_text(json.dumps(s))
+    env = dict(os.environ, DICTATE_CONFIG_DIR=str(cfgdir), DICTATE_LOG=str(log))
+    subprocess.run([sys.executable, str(ROOT / "polish.py")], input="my secret passphrase",
+                   capture_output=True, text=True, env=env, timeout=10, check=True)
+    text = log.read_text()
+    assert "secret" not in text and '"words": 3' in text
+
+
+def test_log_disabled_writes_nothing(cfgdir, tmp_path):
+    log = tmp_path / "log.jsonl"
+    s = json.loads((cfgdir / "settings.json").read_text())
+    s.update({"log_enabled": False, "min_words_for_llm": 100})
+    (cfgdir / "settings.json").write_text(json.dumps(s))
+    env = dict(os.environ, DICTATE_CONFIG_DIR=str(cfgdir), DICTATE_LOG=str(log))
+    out = subprocess.run([sys.executable, str(ROOT / "polish.py")], input="hello there",
+                         capture_output=True, text=True, env=env, timeout=10, check=True)
+    assert out.stdout == "hello there" and not log.exists()
 
 
 def test_empty_input_prints_nothing(cfgdir, tmp_path):

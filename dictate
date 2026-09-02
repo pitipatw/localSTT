@@ -9,6 +9,7 @@
   dictate test "<raw text>"              run polish.py on text (uses Ollama if running)
   dictate log tail [N]                   last N log lines (default 10)
   dictate log stats                      latency / LLM-usage summary
+  dictate log purge                      delete the log (it holds every dictation in plaintext)
   dictate app "<app_id>"                 write app_id hint (for external focus helpers)
 """
 
@@ -109,11 +110,14 @@ def cmd_log(args):
     if sub == "tail":
         n = int(args[1]) if len(args) > 1 else 10
         for e in lines[-n:]:
-            print(f"{e['ts']}  {e['latency_ms']:5d}ms  {e['reason']:<14} {e['final']!r}")
+            print(f"{e['ts']}  {e['latency_ms']:5d}ms  {e['reason']:<14} {e.get('final', '(text logging off)')!r}")
     elif sub == "stats":
         subprocess.run([sys.executable, str(HERE / "tests" / "latency_report.py"), str(p)], check=False)
+    elif sub == "purge":
+        p.unlink()
+        print(f"deleted {p} ({len(lines)} entries)")
     else:
-        die("usage: dictate log tail [N] | dictate log stats")
+        die("usage: dictate log tail [N] | dictate log stats | dictate log purge")
 
 
 def cmd_app(args):
