@@ -22,7 +22,7 @@ Being in `input` means **every process running as you can read every keystroke**
 
 You have two choices:
 
-| | Push-to-talk (default) | Toggle mode (`HOTKEY_MODE=toggle`) |
+| | Push-to-talk (`HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1`) | Toggle mode (default) |
 |---|---|---|
 | Feel | Hold the F13 key, speak, release | Press shortcut, speak, press again |
 | Group added | `input` (read all keyboards + uinput) | `uinput` only (inject, cannot read keyboard) |
@@ -30,33 +30,38 @@ You have two choices:
 | Keylogger exposure | any user process can read keystrokes | unchanged from stock Wayland |
 | Keystroke injection | any user process | any user process (unavoidable — pasting needs it) |
 
-The push-to-talk trade is what most people running evdev dictation on Wayland accept, and on a single-user machine with disk encryption it is defensible. Toggle mode is the safer default if you are unsure, at the cost of the hold-and-release feel. You can switch later by re-running the installer with the other mode and removing yourself from the group you no longer need (`sudo gpasswd -d $USER input`).
+Toggle mode is the default because the `input`-group exposure is silent and permanent, while toggle mode's failure — forgetting to stop the recording — is something you notice, and the output sanitizer (§1.6) makes it harmless in a terminal. The push-to-talk trade is what most people running evdev dictation on Wayland accept, and on a single-user machine with disk encryption it is defensible; the installer makes you say so explicitly with `I_ACCEPT_INPUT_GROUP=1`. The chosen mode is remembered in `~/.config/dictate/hotkey_mode`, so a plain re-run keeps it. To switch, re-run with the other `HOTKEY_MODE` and remove yourself from the group you no longer need (`sudo gpasswd -d $USER input`).
 
 ### 1.3 Supply chain — what you are trusting
 
 | Download | Source | Verification the installer does | Residual trust |
 |---|---|---|---|
-| Voxtype 1.0.1 binary + 2–3 ONNX Runtime `.so` files | GitHub release, pinned version | SHA256 against the release's `SHA256SUMS.txt`, which is GPG-verified against key `9CCF7915B750CAE8B095ED1AA3FC9F33FD209279` (fetched from keys.openpgp.org) | The author's signing key and GitHub. The GPG step is skipped with a warning if the key cannot be fetched; you can verify by hand (§4). |
-| Ollama 0.33.2 tarball | GitHub release, pinned version | SHA256 against the release's `sha256sum.txt` | GitHub and the Ollama project. **No `curl \| sh`**: the tarball is extracted to `/usr/local` and a systemd unit is written by this repo, bound to `127.0.0.1` only, running as a dedicated `ollama` system user. |
-| Parakeet TDT 0.6B v3 (ONNX) | Hugging Face, `istupakov/parakeet-tdt-0.6b-v3-onnx` | None (no checksums published) | ONNX is a protobuf data format; it cannot execute code when loaded. Worst case is a bad model, not a compromised machine. |
-| `qwen3:8b` | Ollama registry | Ollama verifies its own manifests by digest | GGUF is a data format; same reasoning. |
-| apt packages (`ydotool ydotoold wl-clipboard jq zstd gnupg python3-pytest`) | Pop!_OS repos | apt signature checking | Same trust as the rest of your system. |
-| ydotool 1.0.4 source (only if no `ydotoold` package is available) | GitHub, `ReimuNotMoe/ydotool`, pinned tag `v1.0.4` | git tag; the commit hash is printed at build time | Small C project you compile yourself; you can read it in `~/.cache/localstt-downloads/ydotool-1.0.4`. |
+| Voxtype 1.0.1 binary + 2–3 ONNX Runtime `.so` files | GitHub release, pinned version | SHA256 against the release's `SHA256SUMS.txt`, whose signature **must** verify against key `9CCF7915B750CAE8B095ED1AA3FC9F33FD209279` in a dedicated keyring (the signing fingerprint is checked, not just "some key signed it"). `REQUIRE_GPG=0` downgrades to sha256-only with a warning. | The author's signing key and keys.openpgp.org (cached after first fetch in `~/.cache/localstt-downloads/voxtype-signing-key.gpg`). Confirm the fingerprint against the Voxtype release notes once. |
+| Ollama 0.33.2 tarball | GitHub release, pinned version | SHA256 against the release's `sha256sum.txt` **and** against `OLLAMA_SHA256` in `install.sh` once you pin it (the installer prints the hash and nags until you do) | GitHub and the Ollama project. **No `curl \| sh`**: the tarball is extracted to `/usr/local` and a sandboxed systemd unit (`ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, …) is written by this repo, bound to `127.0.0.1` only, running as a dedicated `ollama` system user. |
+| Parakeet TDT 0.6B v3 (ONNX) | Hugging Face, `istupakov/parakeet-tdt-0.6b-v3-onnx`, **pinned commit** `8f23f0c0` | Each LFS file against a sha256 in `install.sh`; the two small text files against their git blob ids. A mismatching file is deleted. | ONNX is data, but it is parsed and executed by ONNX Runtime inside the process that owns the microphone, so it is treated like a binary. |
+| `qwen3:8b` | Ollama registry | After the pull, the weights blob the server loaded is compared with `OLLAMA_MODEL_BLOB_SHA256` | A tag is mutable; the digest is not. GGUF is data and cannot execute code, so a swap would change text output, not the machine. |
+| apt packages (`ydotool ydotoold wl-clipboard jq zstd gnupg git python3-pytest`) | Pop!_OS repos | apt signature checking | Same trust as the rest of your system. |
+| ydotool 1.0.4 source (only if no `ydotoold` package is available) | GitHub, `ReimuNotMoe/ydotool`, tag `v1.0.4` | The checked-out commit must equal `YDOTOOL_COMMIT` (a tag can be moved; a commit hash cannot) | Small C project you compile yourself; you can read it in `~/.cache/localstt-downloads/ydotool-1.0.4`. |
 
-Versions are pinned at the top of `install.sh`. To upgrade, change the version, and the checksum step will verify the new release.
+Versions **and their digests** are pinned together at the top of `install.sh`. To upgrade, change both in the same commit; the installer refuses a version whose digest it does not know.
 
 ### 1.4 Your dictations are logged in plaintext
 
-`~/.local/share/dictate/log.jsonl` stores every raw and cleaned transcript. That is what lets you tune the dictionary and prompt, and later fine-tune, but it means anything you ever dictate — a password, an address, a private message — sits in that file. Controls:
+`~/.local/share/dictate/log.jsonl` can store every raw and cleaned transcript. That is what lets you tune the dictionary and prompt, and later fine-tune, but it means anything you ever dictate — a password, an address, a private message — sits in that file. It is **off by default** (`"log_text": false`: metadata only). Controls:
 
 - The file and its directory are created mode `600`/`700` (owner only).
 - `dictate log purge` deletes it.
-- In `~/.config/dictate/settings.json`, `"log_text": false` keeps only metadata (timestamp, app, latency, word count); `"log_enabled": false` disables logging entirely. Once the prompt is tuned, turning `log_text` off is a sensible default.
+- In `~/.config/dictate/settings.json`, `"log_text": true` records the text; `false` (default) keeps only metadata (timestamp, app, latency, word count); `"log_enabled": false` disables logging entirely. Turn text logging on while tuning the prompt, then off again.
+- Every dictation also passes through the Wayland clipboard. A clipboard-history tool will keep its own copy; there is nothing this project can do about that.
 - Voxtype's own `VOXTYPE_CONTEXT` variable carries the previous dictation for up to 60 s, in process memory only.
 
 ### 1.5 Things that are fine as designed
 
-The ydotool socket is created mode `0600`, so only your user can inject through it. Ollama listens on `127.0.0.1:11434` only; the installer checks this. The cleanup LLM has no tools, so a prompt injection in something you dictate can at worst produce odd text. The post-process hook path is fixed in a config file that is mode `600` under your home, so only something already running as you could change it — and something running as you could do worse things more directly.
+The ydotool socket is created mode `0600` under `$XDG_RUNTIME_DIR` by a daemon running as you (the installer refuses a root daemon with a `/tmp` socket), so only your user can inject through it. Ollama listens on `127.0.0.1:11434` only and runs in a systemd sandbox; the installer checks both. The cleanup LLM has no tools, so a prompt injection in something you dictate can at worst produce odd text — and §1.6 bounds "odd". The post-process hook is an installed *copy* of `polish.py` (not a symlink into the git checkout), and its `ollama_url` can only point at loopback, so neither a `git pull` nor a one-line settings edit can change what runs or where your dictations go.
+
+### 1.6 What gets pasted
+
+Whatever `polish.py` prints is pasted into the focused window with Shift+Insert. Two rules keep that from ever becoming a command: control characters (ESC, BEL, NUL, carriage return, …) are stripped on every path, so terminal escape sequences cannot survive; and newlines are replaced by spaces unless `"allow_newlines": true` is set in `settings.json` — and never for a terminal-style target, whatever the setting. So a video saying "new line" while you forgot the mic on cannot press Enter in your shell. See README → Settings.
 
 ---
 
@@ -85,9 +90,9 @@ git init && git add -A && git commit -m "initial dictation stack"
 **Step 2 — run the installer**
 
 ```bash
-./install.sh                       # push-to-talk (adds you to `input`)
+./install.sh                                                     # toggle mode (default; adds you to `uinput` only)
 # or
-HOTKEY_MODE=toggle ./install.sh    # toggle mode (adds you to `uinput` only)
+HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1 ./install.sh     # push-to-talk (adds you to `input`; see §1.2)
 ```
 
 It asks for your sudo password for: apt installs, the `/dev/uinput` udev rule, the group change, extracting Ollama to `/usr/local`, and creating the `ollama` user and system service. Everything else is under your home directory. Each `==` section ends with green ✔ lines; a yellow `!` is informational; a red ✘ stops the run and says why.
@@ -117,7 +122,24 @@ Compare the GPG key fingerprint with the one published in the Voxtype release no
 
 **Step 5 — toggle mode only: create the shortcut**
 
-COSMIC Settings → Keyboard → Custom shortcuts → add: command `/home/<you>/.local/bin/voxtype record toggle`, key of your choice (e.g. Super+Space). Press once to start, again to stop and paste.
+In toggle mode Voxtype does not listen to the keyboard at all (`[hotkey] enabled = false`). COSMIC, which as the compositor already sees every key press, runs a command when it sees your shortcut. Press once → recording starts; press again → stops, cleans up, pastes.
+
+*Through the GUI:* COSMIC Settings → **Keyboard** → **View and Customize Shortcuts** → **Custom Shortcuts** → **Add Shortcut**. Name `Dictate`; command `/home/<you>/.local/bin/voxtype record toggle` (full path — shortcuts do not run through your shell, so `~` and `PATH` are not expanded); click the key field and press the combination you want. A modifier combo such as **Super+Space** or **Ctrl+Alt+D** is the reliable choice.
+
+*Bare keys such as F13:* COSMIC's shortcut picker often refuses a key with no modifier, so F13 alone may not register even though it works for push-to-talk. If you want a single physical key anyway, either remap it in the keyboard firmware to a *modified* combo (e.g. Super+F13) and bind that, or write the binding directly and log out/in:
+
+```bash
+mkdir -p ~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1
+cat > ~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom <<'EOF'
+{
+    (modifiers: [], key: "F13"): Spawn("/home/<you>/.local/bin/voxtype record toggle"),
+}
+EOF
+```
+
+(If the file already exists, add the line inside the existing braces.) Check first with `wev` that the key actually reaches the compositor as `F13`; if it does not, fix the firmware mapping before fighting the picker.
+
+*Test the binding:* open a text editor, press the shortcut, say "testing one two three", press it again. If nothing happens, run `/home/<you>/.local/bin/voxtype record toggle` twice from a terminal — if that records and pastes, the problem is the shortcut; if it does not, look at `journalctl --user -u voxtype -f`.
 
 **Step 6 — paste path probe (no microphone yet)**
 
@@ -139,7 +161,7 @@ Expect `[llm]` and something like `final: Send it Friday.` If you see `[llm_erro
 
 **Step 8 — first dictation**
 
-Click into the text editor. Push-to-talk: hold the F13 key, say "testing one two three", release. Toggle: press your shortcut, speak, press again. Text should appear in about a second. If nothing happens, run `journalctl --user -u voxtype -f` in another terminal and try again. Common causes: the daemon is not running (`systemctl --user status voxtype`), the hotkey is not seen (group membership not yet active — did you log out?), or the paste landed in another window (an overlay stole focus — keep any OSD disabled).
+Click into the text editor. Toggle (default): press your shortcut from Step 5, say "testing one two three", press it again. Push-to-talk: hold the F13 key, speak, release. Text should appear in about a second. If nothing happens, run `journalctl --user -u voxtype -f` in another terminal and try again. Common causes: the daemon is not running (`systemctl --user status voxtype`), the hotkey is not seen (group membership not yet active — did you log out?), or the paste landed in another window (an overlay stole focus — keep any OSD disabled).
 
 **Step 9 — GPU check**
 
@@ -181,6 +203,8 @@ Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture str
 ---
 
 ## 5. Hotkey: why F13, and the modifier-key trap
+
+This section is about **push-to-talk**, where Voxtype reads the key itself. In toggle mode the key is a COSMIC shortcut (Step 5) and none of the following applies — there a modifier combo is the *preferred* choice.
 
 The dictation key must be a **non-modifier** key. The first choice, Right Ctrl, worked in COSMIC Text Editor but not in Electron apps (the Claude desktop app, and by extension VS Code, Slack, Discord). What happens: holding and releasing a bare modifier — with no other key — leaves Chromium's internal modifier state stale on Wayland. When Voxtype then sends the paste chord about a second later, Electron reads `shift+insert` as `Ctrl+Shift+Insert` and ignores it. Reproduced by hand: press and release Right Ctrl in the Claude box, then fire `ydotool key -d 60 42:1 110:1 110:0 42:0` — nothing pastes; without the Ctrl press, it pastes.
 
