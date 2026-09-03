@@ -152,7 +152,9 @@ step_ydotool() {
     # types those literally (you see "4114" instead of a paste). Build 1.0.x if the package is older.
     local pkgver
     pkgver=$(dpkg-query -W -f='${Version}' ydotool 2>/dev/null || echo 0)
-    if [[ ${YDOTOOL_FROM_SOURCE:-0} == 1 ]] || ! dpkg --compare-versions "$pkgver" ge 1.0; then
+    if [[ -x "$HOME/.local/bin/ydotoold" && -x "$HOME/.local/bin/ydotool" && ${YDOTOOL_FROM_SOURCE:-0} != 1 ]]; then
+      ok "ydotool $YDOTOOL_VERSION already built in $HOME/.local/bin (YDOTOOL_FROM_SOURCE=1 to rebuild)"
+    elif [[ ${YDOTOOL_FROM_SOURCE:-0} == 1 ]] || ! dpkg --compare-versions "$pkgver" ge 1.0; then
       warn "packaged ydotool is $pkgver (< 1.0) — building $YDOTOOL_VERSION from source so Voxtype's key syntax works"
       build_ydotool
     fi
@@ -282,10 +284,11 @@ EOF
 }
 
 step_voxtype() {
-  # VOXTYPE_VARIANT=auto (default: cuda-12/13 by driver) | cpu (onnx-avx2, no GPU libs needed)
-  local want_variant="${VOXTYPE_VARIANT:-auto}"
-  step "Voxtype $VOXTYPE_VERSION  (variant: $want_variant, sha256 + GPG verified)"
+  # VOXTYPE_VARIANT=auto (cuda-12/13 by driver) | cpu (onnx-avx2, no GPU libs needed).
+  # Unset: keep whatever variant is already installed (recorded in $VOX_LIB/.variant); auto on a fresh machine.
   local stamp="$VOX_LIB/.variant"
+  local want_variant="${VOXTYPE_VARIANT:-$(cat "$stamp" 2>/dev/null || echo auto)}"
+  step "Voxtype $VOXTYPE_VERSION  (variant: $want_variant, sha256 + GPG verified)"
   if [[ -x "$VOX_LIB/voxtype" ]] && "$VOX_LIB/voxtype" --version 2>/dev/null | grep -q "$VOXTYPE_VERSION" \
      && [[ "$(cat "$stamp" 2>/dev/null)" == "$want_variant" ]]; then
     ok "already installed: $("$VOX_LIB/voxtype" --version | head -1) ($(cat "$stamp"))"
@@ -395,6 +398,7 @@ step_service() {
   mkdir -p "$HOME/.config/systemd/user/voxtype.service.d"
   cat > "$HOME/.config/systemd/user/voxtype.service.d/override.conf" <<EOF
 [Service]
+TimeoutStopSec=10
 Environment="LD_LIBRARY_PATH=$VOX_LIB:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
 Environment="YDOTOOL_SOCKET=${YDOTOOL_SOCKET:-$XDG_RUNTIME_DIR/.ydotool_socket}"
 Environment="PATH=$BIN:/usr/local/bin:/usr/bin:/bin"
@@ -416,7 +420,7 @@ step_summary() {
   1. $( ((NEED_RELOGIN)) && echo "LOG OUT AND BACK IN (new group membership), then re-run: ./install.sh" || echo "no re-login needed" )
   2. Paste probe:  echo hello | wl-copy; focus an editor; sleep 3 && ydotool key shift+insert
   3. LLM probe:    dictate test "send it monday actually delete that send it friday"
-  4. Mic probe:    $( [[ $HOTKEY_MODE == toggle ]] && echo "press your toggle shortcut, say 'testing one two three', press again" || echo "hold RIGHT CTRL, say 'testing one two three', release" ) → text appears
+  4. Mic probe:    $( [[ $HOTKEY_MODE == toggle ]] && echo "press your toggle shortcut, say 'testing one two three', press again" || echo "hold the F13 key, say 'testing one two three', release" ) → text appears
   5. Mic-in-use check: run  pw-top  and confirm a voxtype capture stream exists ONLY while recording
   6. After ~20 dictations: dictate log stats
   Logs: journalctl --user -u voxtype -f   |   dictate log tail   |   dictate log purge
