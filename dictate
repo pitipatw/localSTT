@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
-"""dictate — companion CLI for the local dictation setup.
+"""dictate — companion CLI for the local dictation setup. Changes take effect on
+the next dictation; nothing needs a restart.
 
-  dictate fix "<heard>" "<intended>"     teach a spelling (corrections.json)
-  dictate unfix "<heard>"                remove a correction
-  dictate snippet "<trigger>" "<text>"   add a snippet (snippets.json)
-  dictate jargon "<term>" [...]          add terms to jargon.txt
-  dictate list                           show corrections, snippets, jargon
-  dictate test "<raw text>"              run polish.py on text (uses Ollama if running)
-  dictate log tail [N]                   last N log lines (default 10)
-  dictate log stats                      latency / LLM-usage summary
-  dictate log purge                      delete the log (it holds every dictation in plaintext)
-  dictate app "<app_id>"                 write app_id hint (for external focus helpers)
+Teaching (files in ~/.config/dictate/):
+  dictate fix "<heard>" "<intended>"     dictionary rule: whole-word, case-insensitive replacement
+                                         applied BEFORE the LLM. Use for mishearings ("i get committed"
+                                         -> "git commit"). The only fix for dictations < 6 words.
+  dictate unfix "<heard>"                remove that rule
+  dictate snippet "<trigger>" "<text>"   whole-utterance trigger -> pasted text, LLM skipped
+  dictate jargon "<term>" [...]          add to the "spell exactly like this" list in the LLM prompt.
+                                         Use when the ASR heard it but the LLM respells it.
+  dictate list                           show corrections, snippets, jargon, model
+
+Checking:
+  dictate test "<raw text>"              run the full pipeline on text; prints stage + result
+  dictate log tail [N]                   last N entries: 'raw' -> 'final' when changed (default 10)
+  dictate log stats                      latency percentiles, stage counts, LLM change rate
+  dictate log purge                      delete ~/.local/share/dictate/log.jsonl — it holds every
+                                         dictation in plaintext until you do
+  dictate app "<app_id>"                 write a focused-app hint (for a future focus helper)
+
+Where a mistake came from (dictate log tail):
+  raw already wrong  -> ASR misheard        -> dictate fix
+  raw right, final wrong -> LLM respelled   -> dictate jargon, then a Raw:/Clean: example in prompt.md
 """
 
 from __future__ import annotations

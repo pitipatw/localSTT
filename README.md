@@ -59,6 +59,41 @@ Before the first dictation, remap a spare physical key to **F13** in your keyboa
 - Privacy: the log holds every dictation in plaintext (mode 600). `dictate log purge` deletes it; `"log_text": false` in `~/.config/dictate/settings.json` keeps only metadata.
 - **Not in COSMIC Terminal.** It pastes only on Ctrl+Shift+V and ignores Shift+Insert, and no single chord works in both terminals and GTK/Electron apps. Alacritty, kitty and foot honour Shift+Insert if you want terminal dictation.
 
+## The `dictate` command
+
+`dictate` is a small Python CLI (symlinked to `~/.local/bin/dictate`) that edits the data files `polish.py` reads and inspects what it did. Nothing it changes needs a restart: `polish.py` re-reads the files on every dictation, so a fix takes effect on the very next one.
+
+| Command | What it does | Writes to |
+|---|---|---|
+| `dictate fix "<heard>" "<intended>"` | Adds a dictionary rule: whenever the transcript contains `<heard>` as whole words (case-insensitive, any spacing), replace it with `<intended>`. Multi-word phrases are fine and safer than single words. | `corrections.json` |
+| `dictate unfix "<heard>"` | Removes that rule. | `corrections.json` |
+| `dictate snippet "<trigger>" "<text>"` | When an *entire* dictation equals `<trigger>` (ignoring case and trailing punctuation), paste `<text>` instead — the LLM is skipped. For addresses, sign-offs, boilerplate. | `snippets.json` |
+| `dictate jargon "<term>" [...]` | Adds terms to the "spell exactly like this" list in the LLM prompt. For words the ASR hears right but the LLM might "correct" or mis-capitalize (PipeWire, Qwen3, git commit). | `jargon.txt` |
+| `dictate list` | Shows every correction, snippet and jargon term, and which model is configured. | — |
+| `dictate test "<raw text>"` | Runs the full pipeline on the text as if it had been dictated, using Ollama if it is up, and prints which stage decided (`snippet`, `short`, `llm`, `length_guard`, `llm_error`), the dictionary-corrected text, and the final text. Use it to confirm a fix before relying on it. | log |
+| `dictate log tail [N]` | Last N log entries (default 10): timestamp, hook latency, stage, and the text — shown as `'raw' -> 'final'` when the pipeline changed something, plain otherwise. This is how you tell whether a mistake came from the ASR (raw already wrong → `dictate fix`) or from the LLM (raw right, final wrong → jargon or a prompt example). | — |
+| `dictate log stats` | Median / p95 / max hook latency split by LLM vs non-LLM path, counts per stage, and how often the LLM changed the text. Run after ~20 dictations. | — |
+| `dictate log purge` | Deletes the log file entirely. See Privacy below. | — |
+| `dictate app "<app_id>"` | Writes an app-id hint that `polish.py` reads for up to 5 s to pick a formatting style (terminal / code / email / chat). Meant for a future focus-tracking helper, not for daily use. | `app_id` |
+
+Which fix for which mistake:
+
+- The ASR **misheard** ("kuber netties", "i get committed") → `dictate fix`. Deterministic, applies before the LLM, and is the *only* fix for dictations under six words, which skip the LLM entirely.
+- The ASR heard it, the LLM **respelled** it ("pipewire", "Committee" for "git commit" in a longer sentence) → `dictate jargon`, and if it persists, a `Raw: … / Clean: …` pair in `~/.config/dictate/prompt.md`.
+- The LLM handled a **pattern** wrong (missed a self-correction, added a period in a terse context) → a prompt example; they are sent to the model as demonstrations, which small models follow much better than rules.
+
+Files, all under `~/.config/dictate/` (installed once from `config/`, then yours):
+
+| File | Format |
+|---|---|
+| `corrections.json` | `{"heard phrase": "Intended Spelling"}` |
+| `snippets.json` | `{"spoken trigger": "expanded text"}` — `\n` for line breaks |
+| `jargon.txt` | one term per line; `#` comments |
+| `prompt.md` | system prompt; `{APP_CONTEXT}` and `{JARGON_LIST}` are filled in; `Raw:`/`Clean:` pairs become chat turns |
+| `settings.json` | `model`, `ollama_url`, `temperature`, `think`, `llm_timeout_s`, `min_words_for_llm`, `max_growth`, `max_shrink`, `log_enabled`, `log_text` |
+
+The log lives at `~/.local/share/dictate/log.jsonl`, one JSON object per dictation, created mode 600. With `"log_text": true` (default) each entry holds `raw`, `corrected` and `final` — i.e. every word you dictate, in plaintext, until you purge. Keep it while tuning; then `dictate log purge` and consider `"log_text": false`, which keeps only timestamp, stage, latency and word count. `"log_enabled": false` turns logging off entirely. Purging never touches corrections, snippets or jargon.
+
 ## Repository layout
 
 ```
