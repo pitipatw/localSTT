@@ -8,5 +8,6 @@
   "max_growth": 0.3,
   "max_shrink": 0.75,
   "log_enabled": true,
-  "log_text": true
+  "allow_newlines": false,
+  "log_text": false
 }
