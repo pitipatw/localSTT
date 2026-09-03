@@ -147,11 +147,13 @@ Click into the text editor. Push-to-talk: hold the F13 key, say "testing one two
 
 **Step 10 — integration checks**
 
-Repeat step 8 in Firefox, VS Code, and COSMIC Terminal (all use `shift+insert`, so no per-app configuration). Copy an image, dictate, confirm the image is still on the clipboard afterwards. Hold and release without speaking: nothing should paste. Dictate for 30 s: no truncation.
+Repeat step 8 in Firefox/Edge, VS Code, and the Claude app (all accept `shift+insert`, so no per-app configuration). Copy an image, dictate, confirm the image is still on the clipboard afterwards. Hold and release without speaking: nothing should paste. Dictate for 30 s: no truncation.
+
+**Known exception: COSMIC Terminal.** It pastes only on Ctrl+Shift+V and ignores Shift+Insert, and there is no single chord that works in terminals *and* GTK/Electron apps. Dictation into COSMIC Terminal is therefore not supported; the text is still copied to the clipboard for ~300 ms, but not long enough to paste by hand. If terminal dictation matters to you, Alacritty, kitty and foot all honour Shift+Insert.
 
 **Step 11 — microphone-in-use check**
 
-Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture stream; while recording, one should appear; when you release, it should go away. If a stream stays open permanently, that is worth knowing (and worth reporting upstream); it does not mean audio is being sent anywhere, but it is the behaviour §1.1 assumes.
+Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture stream; while recording, one should appear; when you release, it should go away. Expect two rows while recording: the microphone *device* (e.g. a webcam's audio node, woken up because something is reading from it) and the `voxtype` *stream* consuming it — that pairing is normal. A `voxtype` row that persists while idle, or the device staying active with no stream under it, would be worth investigating. If a stream stays open permanently, that is worth knowing (and worth reporting upstream); it does not mean audio is being sent anywhere, but it is the behaviour §1.1 assumes.
 
 **Step 12 — tune over the first week**
 
@@ -178,7 +180,23 @@ Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture str
 
 ---
 
-## 5. Troubleshooting quick reference
+## 5. Hotkey: why F13, and the modifier-key trap
+
+The dictation key must be a **non-modifier** key. The first choice, Right Ctrl, worked in COSMIC Text Editor but not in Electron apps (the Claude desktop app, and by extension VS Code, Slack, Discord). What happens: holding and releasing a bare modifier — with no other key — leaves Chromium's internal modifier state stale on Wayland. When Voxtype then sends the paste chord about a second later, Electron reads `shift+insert` as `Ctrl+Shift+Insert` and ignores it. Reproduced by hand: press and release Right Ctrl in the Claude box, then fire `ydotool key -d 60 42:1 110:1 110:0 42:0` — nothing pastes; without the Ctrl press, it pastes.
+
+Symptoms that point at this:
+
+- Dictation pastes in GTK apps but not in Electron apps, while the journal says `Text pasted via clipboard + shift+insert`.
+- With `paste_keys = "ctrl+v"`, a lone `v` appears instead of the text.
+- A `.` (or another character) appears when you hold the key: the keyboard firmware has it as a tap-hold key.
+
+Fix: remap a spare physical key to **F13** in the keyboard's firmware tool (VIA/QMK: Configure → layer 0 → click the key → F13), verify with `evtest` (`KEY_F13`, code 183), set `key = "F13"` under `[hotkey]`, `systemctl --user restart voxtype`. F13–F24 are real keycodes that no application binds, so there are no side effects in any app. Keyboards that cannot be remapped: `PAUSE` or `SCROLLLOCK`.
+
+Related, found on the same path: Electron also needs more than ydotool's default 12 ms between the modifier and the key of the paste chord, hence `type_delay_ms = 60` in `[output]` (Voxtype passes it as `ydotool key -d 60`). And Voxtype requires ydotool **1.0.x** on both client and daemon — it drives the client with numeric `code:state` arguments, which a pre-1.0 client types literally (you see `4114`), and a 1.0 client cannot talk to a pre-1.0 daemon. On this Pop!_OS the packaged pair did not qualify, so the installer builds 1.0.4 into `~/.local/bin` and runs that daemon from a user unit.
+
+---
+
+## 6. Troubleshooting quick reference
 
 | Symptom | Check |
 |---|---|
@@ -190,4 +208,7 @@ Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture str
 | `[llm_error]` in `dictate test` | `systemctl status ollama`, `ss -ltn \| grep 11434`, `ollama list` |
 | Transcription slow (~1 s+) | GPU fallback to CPU; see step 9. |
 | Checksum mismatch | Delete `~/.cache/localtts-downloads/*` and re-run. If it persists, do not install — the release may have been re-uploaded or tampered with; compare against the GitHub release page. |
-| Hotkey ignored in push-to-talk | `id -nG \| grep input`; `journalctl --user -u voxtype` for "permission denied" on `/dev/input` |
+| Hotkey ignored in push-to-talk | `id -nG \| grep input`; `journalctl --user -u voxtype` for "permission denied" on `/dev/input`; `evtest` to confirm the key's evdev name matches `key = …` |
+| Pastes in GTK apps but not Electron (Claude, VS Code) | Hotkey is a modifier key → §5. Also check `type_delay_ms = 60`. |
+| `4114` (or other digits) typed instead of a paste | ydotool client is pre-1.0 → §5; `./install.sh ydotool` builds 1.0.4. |
+| Daemon logs `Loading Parakeet … model` and nothing after; 0 % CPU | CUDA build hung in its CPU fallback (no CUDA runtime installed). `VOXTYPE_VARIANT=cpu ./install.sh voxtype` for the avx2 build, or install CUDA 13 runtime + cuDNN 9. |

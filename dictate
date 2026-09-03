@@ -110,7 +110,9 @@ def cmd_log(args):
     if sub == "tail":
         n = int(args[1]) if len(args) > 1 else 10
         for e in lines[-n:]:
-            print(f"{e['ts']}  {e['latency_ms']:5d}ms  {e['reason']:<14} {e.get('final', '(text logging off)')!r}")
+            raw, final = e.get("raw"), e.get("final", "(text logging off)")
+            shown = f"{raw!r} -> {final!r}" if raw is not None and raw.strip() != final.strip() else repr(final)
+            print(f"{e['ts']}  {e['latency_ms']:5d}ms  {e['reason']:<14} {shown}")
     elif sub == "stats":
         subprocess.run([sys.executable, str(HERE / "tests" / "latency_report.py"), str(p)], check=False)
     elif sub == "purge":
