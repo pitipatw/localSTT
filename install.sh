@@ -7,35 +7,67 @@
 #   ./install.sh --list               show step names
 #   ./install.sh <step>...            run only the named steps (e.g. ./install.sh voxtype model)
 #
-# Security posture (see INSTALL.md):
-#   * Nothing is piped from the network into a shell. Binaries are pinned to the
-#     versions below and checked against the publisher's SHA256 list; Voxtype's
-#     list is also GPG-verified when gpg is available.
+# Security posture (see INSTALL.md and SECURITY_REVIEW.md):
+#   * Nothing is piped from the network into a shell. Every download is pinned to
+#     a version AND to a digest recorded in this file; a mismatch stops the run.
+#     Voxtype's SHA256SUMS.txt must carry a valid signature from VOXTYPE_GPG_KEY
+#     (REQUIRE_GPG=0 to accept sha256-only, not recommended).
+#   * Default hotkey mode is toggle (no `input` group). push_to_talk must be
+#     confirmed with I_ACCEPT_INPUT_GROUP=1 because it exposes every keystroke.
 #   * The only privileged actions are apt installs, the udev rule, group membership,
-#     and installing Ollama under /usr/local with its own system user.
+#     and installing Ollama under /usr/local with its own sandboxed system user.
 
 set -euo pipefail
 trap 'printf "  \033[31m✘\033[0m unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
-# ---- pinned versions -------------------------------------------------------
+# ---- pinned versions + digests ---------------------------------------------
+# A version is a name we ask a server for; the digest is what proves we got the bytes
+# we expected. Bump both in the same commit.
 VOXTYPE_VERSION="1.0.1"
 VOXTYPE_GPG_KEY="9CCF7915B750CAE8B095ED1AA3FC9F33FD209279"   # from the release notes
+REQUIRE_GPG="${REQUIRE_GPG:-1}"                               # 0 = accept sha256-only with a warning
+
 OLLAMA_VERSION="0.33.2"
+OLLAMA_SHA256="9785247dea264d9072f09f6c9c0eb4b8e666892826a3d8388eba3e8fb9ed1db9"   # sha256 of ollama-linux-amd64.tar.zst for OLLAMA_VERSION. Empty = verify against the
+                   # release's sha256sum.txt only (same origin as the tarball) and nag until you pin it:
+                   #   sha256sum ~/.cache/localstt-downloads/ollama-$OLLAMA_VERSION.tar.zst
 OLLAMA_MODEL="qwen3:8b"
+# digest of the weights blob in the registry manifest for OLLAMA_MODEL (registry.ollama.ai/v2/library/qwen3/manifests/8b)
+OLLAMA_MODEL_BLOB_SHA256="a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f"
+
 YDOTOOL_VERSION="1.0.4"        # only used if the distro package lacks ydotoold
-PARAKEET_REPO="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
+YDOTOOL_COMMIT="57ba7d0af525e82da2de0e275d169477f293b197"   # what tag v1.0.4 points at (tags can move; commits cannot)
+
+PARAKEET_REV="8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce"     # commit in the HF repo, not the mutable `main`
+PARAKEET_REPO="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/$PARAKEET_REV"
+# LFS files: sha256 (from the repo's LFS pointers). Small text files are stored in git, not LFS,
+# so they are pinned by git blob id (sha1, verified with `git hash-object`).
+declare -A PARAKEET_SHA256=(
+  [encoder-model.onnx]="98a74b21b4cc0017c1e7030319a4a96f4a9506e50f0708f3a516d02a77c96bb1"
+  [encoder-model.onnx.data]="9a22d372c51455c34f13405da2520baefb7125bd16981397561423ed32d24f36"
+  [decoder_joint-model.onnx]="e978ddf6688527182c10fde2eb4b83068421648985ef23f7a86be732be8706c1"
+)
+declare -A PARAKEET_GITBLOB=(
+  [vocab.txt]="fc43e1c723e262df60b70e1919614417162d1fe2"
+  [config.json]="02a773005666393de591dfd55230b778da1653d8"
+)
 # ---------------------------------------------------------------------------
 
-HOTKEY_MODE="${HOTKEY_MODE:-push_to_talk}"     # push_to_talk | toggle
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/.local/bin"
 VOX_LIB="$HOME/.local/lib/voxtype"
 DICTATE_DIR="$HOME/.config/dictate"
+MODE_STAMP="$DICTATE_DIR/hotkey_mode"           # remembers the mode chosen on a previous run
+# Mode precedence: explicit HOTKEY_MODE > what a previous run installed > toggle.
+# Toggle is the default because push_to_talk needs the `input` group (see INSTALL.md §1).
+HOTKEY_MODE="${HOTKEY_MODE:-$(cat "$MODE_STAMP" 2>/dev/null || echo toggle)}"     # push_to_talk | toggle
+ME="$(id -un)"                                  # not $USER: that is just an environment variable
 VOX_CFG_DIR="$HOME/.config/voxtype"
 MODEL_DIR="$HOME/.local/share/voxtype/models/parakeet-tdt-0.6b-v3"
 LOG_DIR="$HOME/.local/share/dictate"
 DL="$HOME/.cache/localstt-downloads"
 NEED_RELOGIN=0
+[[ $EUID -ne 0 ]] || { echo "run install.sh as your normal user; it calls sudo where needed" >&2; exit 1; }
 mkdir -p "$DL"
 
 bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -43,13 +75,25 @@ ok()    { printf '  \033[32m✔\033[0m %s\n' "$*"; }
 warn()  { printf '  \033[33m!\033[0m %s\n' "$*"; }
 fail()  { printf '  \033[31m✘\033[0m %s\n' "$*"; exit 1; }
 step()  { echo; bold "== $1"; }
-fetch() { # fetch <url> <dest>  (skips if dest exists and is non-empty)
+fetch() { # fetch <url> <dest>  (skips if dest exists and is non-empty; https only, also after redirects)
   [[ -s "$2" ]] && return 0
-  curl -fL --progress-bar --retry 3 -o "$2.part" "$1" && mv "$2.part" "$2"
+  curl -fL --proto '=https' --proto-redir '=https' --progress-bar --retry 3 -o "$2.part" "$1" && mv "$2.part" "$2"
 }
 
 case "$HOTKEY_MODE" in
-  push_to_talk) UINPUT_GROUP=input ;;
+  push_to_talk)
+    UINPUT_GROUP=input
+    if [[ ${I_ACCEPT_INPUT_GROUP:-0} != 1 ]]; then
+      cat >&2 <<'MSG'
+push_to_talk adds you to the 'input' group. After that, EVERY program running as you can read
+every keystroke from /dev/input (passwords included) and inject keystrokes — not just Voxtype.
+See INSTALL.md §1. To accept that trade-off, re-run with:
+    HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1 ./install.sh
+or use the default:
+    HOTKEY_MODE=toggle ./install.sh
+MSG
+      exit 1
+    fi ;;
   toggle)       UINPUT_GROUP=uinput ;;
   *) fail "HOTKEY_MODE must be push_to_talk or toggle" ;;
 esac
@@ -64,7 +108,9 @@ build_ydotool() {
   if [[ ! -d $src/.git ]]; then
     git clone --depth 1 --branch "v$YDOTOOL_VERSION" https://github.com/ReimuNotMoe/ydotool "$src"
   fi
-  echo "  source: $(git -C "$src" rev-parse HEAD) (tag v$YDOTOOL_VERSION)"
+  local head; head=$(git -C "$src" rev-parse HEAD)
+  [[ $head == "$YDOTOOL_COMMIT" ]] || fail "ydotool tag v$YDOTOOL_VERSION is at $head, expected $YDOTOOL_COMMIT (tag moved?) — rm -rf $src"
+  echo "  source: $head (tag v$YDOTOOL_VERSION, pinned)"
   cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local" >/dev/null
   cmake --build "$src/build" -j"$(nproc)" >/dev/null
   # not `cmake --install`: it also tries to drop a unit into /usr/lib/systemd (needs root; we have our own unit)
@@ -92,7 +138,7 @@ step_preflight() {
 step_apt() {
   step "apt packages"
   # Debian/Ubuntu split ydotool into `ydotool` (client) and `ydotoold` (daemon).
-  local pkgs=(ydotool ydotoold wl-clipboard curl jq zstd gnupg python3 python3-pytest)
+  local pkgs=(ydotool ydotoold wl-clipboard curl jq zstd gnupg git python3 python3-pytest)   # git: hash-object for model pins
   local missing=()
   for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
   if ((${#missing[@]})); then
@@ -114,14 +160,14 @@ step_ydotool() {
   if [[ $UINPUT_GROUP == uinput ]] && ! getent group uinput >/dev/null; then
     sudo groupadd --system uinput; ok "created group uinput"
   fi
-  if id -nG "$USER" | grep -qw "$UINPUT_GROUP"; then
-    ok "$USER is in group $UINPUT_GROUP"
+  if id -nG "$ME" | grep -qw "$UINPUT_GROUP"; then
+    ok "$ME is in group $UINPUT_GROUP"
   else
-    sudo usermod -aG "$UINPUT_GROUP" "$USER"; NEED_RELOGIN=1
-    warn "added $USER to group $UINPUT_GROUP — takes effect after logout/login"
+    sudo usermod -aG "$UINPUT_GROUP" "$ME"; NEED_RELOGIN=1
+    warn "added $ME to group $UINPUT_GROUP — takes effect after logout/login"
   fi
-  if [[ $UINPUT_GROUP == uinput ]] && id -nG "$USER" | grep -qw input; then
-    warn "$USER is ALSO in group 'input' (keyboard read access). Toggle mode does not need it: sudo gpasswd -d $USER input"
+  if [[ $UINPUT_GROUP == uinput ]] && id -nG "$ME" | grep -qw input; then
+    warn "$ME is ALSO in group 'input' (keyboard read access). Toggle mode does not need it: sudo gpasswd -d $ME input"
   fi
 
   local rule=/etc/udev/rules.d/80-uinput.rules
@@ -140,14 +186,15 @@ step_ydotool() {
   mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/environment.d"
   local sock daemon
 
-  # Case A: the distro runs ydotoold as a SYSTEM service (root). Use it as-is.
-  if systemctl is-active ydotool >/dev/null 2>&1; then
-    sock=$(systemctl show ydotool -p ExecStart --value | grep -o -- '--socket-path=[^ ]*' | cut -d= -f2 || true)
-    [[ -z $sock ]] && sock="/tmp/.ydotool_socket"
-    ok "distro system ydotool.service is running (socket $sock); not installing a user unit"
-    systemctl --user disable --now ydotool >/dev/null 2>&1 || true
-  else
-    # Case B: our user unit. Locate the daemon binary — packages differ on where it lives.
+  # A distro-level ydotool.service runs ydotoold as ROOT with its socket in /tmp: anyone who
+  # can reach that socket injects keystrokes with root's uinput handle. We always run our own
+  # user-owned daemon with a 0600 socket under $XDG_RUNTIME_DIR instead.
+  if systemctl is-enabled ydotool >/dev/null 2>&1 || systemctl is-active ydotool >/dev/null 2>&1; then
+    warn "disabling the distro's system-wide (root) ydotool.service in favour of a user-owned daemon"
+    sudo systemctl disable --now ydotool || true
+  fi
+  {
+    # Our user unit. Locate the daemon binary — packages differ on where it lives.
     # Voxtype drives ydotool with 1.0-style numeric args ("42:1 110:1 …"); a pre-1.0 client
     # types those literally (you see "4114" instead of a paste). Build 1.0.x if the package is older.
     local pkgver
@@ -173,7 +220,11 @@ step_ydotool() {
     ok "ydotoold at $daemon"
     local unit="$HOME/.config/systemd/user/ydotool.service"
     if [[ ! -f $unit ]] || ! grep -q "^ExecStart=$daemon" "$unit"; then
-      sed "s#^ExecStart=/usr/bin/ydotoold#ExecStart=$daemon#" "$REPO/systemd/ydotool.service" > "$unit"
+      local line
+      while IFS= read -r line; do
+        [[ $line == "ExecStart=/usr/bin/ydotoold"* ]] && line="ExecStart=$daemon${line#ExecStart=/usr/bin/ydotoold}"
+        printf '%s\n' "$line"
+      done < "$REPO/systemd/ydotool.service" > "$unit"
       systemctl --user daemon-reload
       ok "wrote user unit ($unit)"
     else
@@ -188,21 +239,24 @@ step_ydotool() {
            | grep -o 'listening on socket [^ ]*' | tail -1 | awk '{print $NF}' || true)
     if [[ -z $sock ]]; then
       sock=$(systemctl --user show ydotool -p ExecStart --value | grep -o -- '--socket-path=[^ ]*' | cut -d= -f2 || true)
-      sock="${sock//%t/$XDG_RUNTIME_DIR}"
+      sock="${sock//%t/"$XDG_RUNTIME_DIR"}"
     fi
-    [[ -z $sock ]] && sock="/tmp/.ydotool_socket"
-  fi
+    [[ -z $sock ]] && sock="$XDG_RUNTIME_DIR/.ydotool_socket"
+  }
+  [[ $sock == /tmp/* ]] && fail "ydotoold socket landed in /tmp ($sock) — refusing a world-writable location; check the unit"
 
-  echo "YDOTOOL_SOCKET=$sock" > "$HOME/.config/environment.d/ydotool.conf"
-  sed -i '/YDOTOOL_SOCKET/d' "$HOME/.profile" 2>/dev/null || true
-  echo "export YDOTOOL_SOCKET=\"$sock\"" >> "$HOME/.profile"
+  # The socket path is scraped from a daemon log line: quote it as data, never as shell.
+  printf 'YDOTOOL_SOCKET=%s\n' "$sock" > "$HOME/.config/environment.d/ydotool.conf"
+  sed -i '/^export YDOTOOL_SOCKET=/d' "$HOME/.profile" 2>/dev/null || true
+  printf 'export YDOTOOL_SOCKET=%q\n' "$sock" >> "$HOME/.profile"
   export YDOTOOL_SOCKET="$sock"
 
-  if systemctl is-active ydotool >/dev/null 2>&1 || systemctl --user is-active ydotool >/dev/null 2>&1; then
+  if systemctl --user is-active ydotool >/dev/null 2>&1; then
     ok "ydotoold running, socket $sock"
     if [[ -S $sock ]]; then
       ls -l "$sock" | sed 's/^/  /'
-      [[ "$(stat -c %a "$sock")" == "600" ]] || warn "socket is not mode 600 — other local users could inject keystrokes; consider a system-wide multi-user review"
+      [[ "$(stat -c '%a %U' "$sock")" == "600 $ME" ]] \
+        || fail "socket $sock must be mode 600 and owned by $ME — as is, other local users could inject keystrokes"
     else
       warn "socket $sock not present — check: journalctl --user -u ydotool -n 5"
     fi
@@ -215,7 +269,7 @@ step_ydotool() {
 }
 
 step_ollama() {
-  step "Ollama $OLLAMA_VERSION + $OLLAMA_MODEL  (pinned tarball, sha256-verified, no curl|sh)"
+  step "Ollama $OLLAMA_VERSION + $OLLAMA_MODEL  (pinned tarball, sha256-verified, sandboxed unit, no curl|sh)"
   local marker="$DL/ollama-$OLLAMA_VERSION.installed"
   if [[ -f $marker && -x /usr/local/bin/ollama ]]; then
     ok "ollama $OLLAMA_VERSION already extracted to /usr/local"
@@ -229,7 +283,12 @@ step_ollama() {
     have=$(sha256sum "$DL/ollama-$OLLAMA_VERSION.tar.zst" | awk '{print $1}')
     [[ -n $want ]] || fail "could not find ollama-linux-amd64.tar.zst in sha256sum.txt — show me: cat $DL/ollama-$OLLAMA_VERSION.sha256sum.txt"
     [[ $want == "$have" ]] || fail "ollama tarball checksum mismatch (want $want, have $have) — delete $DL/ollama-* and retry"
-    ok "sha256 verified"
+    if [[ -n $OLLAMA_SHA256 ]]; then
+      [[ $have == "$OLLAMA_SHA256" ]] || fail "ollama tarball does not match OLLAMA_SHA256 pinned in install.sh (have $have)"
+      ok "sha256 verified against the digest pinned in install.sh"
+    else
+      warn "sha256 matches the release's own list only. Pin it: OLLAMA_SHA256=\"$have\" in install.sh"
+    fi
     sudo tar -C /usr/local --zstd -xf "$DL/ollama-$OLLAMA_VERSION.tar.zst"
     touch "$marker"
     ok "extracted to /usr/local/bin/ollama"
@@ -242,10 +301,16 @@ step_ollama() {
     sudo cp "$unit" "$unit.bak.$(date +%s)"
     warn "replacing pre-existing $unit (backup kept) so the service runs the verified binary bound to 127.0.0.1"
   fi
-  if [[ ! -f $unit ]] || ! grep -q '^# managed by localSTT v2' "$unit"; then
+  if [[ ! -f $unit ]] || ! grep -q '^# managed by localSTT v3' "$unit"; then
     sudo tee "$unit" >/dev/null <<'EOF'
-# managed by localSTT v2 (install.sh) — keeps the cleanup model resident in VRAM so the
-# first dictation after idle does not hit the hook's 4 s timeout.
+# managed by localSTT v3 (install.sh) — keeps the cleanup model resident so the first
+# dictation after idle does not hit the hook's 4 s timeout.
+#
+# Sandbox (stage A of SECURITY_REVIEW.md M4): the API has no authentication, so limit what
+# the process can touch if it is ever abused. It can read the OS, write only its model
+# store, and cannot gain privileges. Stage B (DevicePolicy=closed + DeviceAllow for the
+# NVIDIA nodes) is deliberately NOT applied yet: add it together with GPU support and
+# verify with `ollama ps` that the model still loads on the GPU.
 [Unit]
 Description=Ollama (local LLM server)
 After=network-online.target
@@ -260,6 +325,24 @@ Environment="OLLAMA_HOST=127.0.0.1:11434"
 Environment="OLLAMA_KEEP_ALIVE=-1"
 Environment="HOME=/usr/share/ollama"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/usr/share/ollama
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -275,12 +358,42 @@ EOF
   done
   [[ $running == "$OLLAMA_VERSION" ]] && ok "server running $running" || fail "server on :11434 reports version '${running:-none}', expected $OLLAMA_VERSION — sudo journalctl -u ollama -n 20"
   ss -ltn | grep -q '127.0.0.1:11434' && ok "listening on 127.0.0.1:11434 only" || warn "not bound to 127.0.0.1:11434 — check: ss -ltn | grep 11434"
+  command -v systemd-analyze >/dev/null && echo "  sandbox: $(systemd-analyze security ollama 2>/dev/null | tail -1 | sed 's/^→ //')"
   ollama list 2>/dev/null | grep -q "^${OLLAMA_MODEL}" || ollama pull "$OLLAMA_MODEL"
+  # A registry tag is mutable. Check the weights blob the server actually loaded against the
+  # digest pinned above (the FROM line of the Modelfile names the blob by its sha256).
+  local blob
+  blob=$(ollama show "$OLLAMA_MODEL" --modelfile 2>/dev/null | grep -oE '^FROM .*sha256[-:]([0-9a-f]{64})' | grep -oE '[0-9a-f]{64}$' | head -1 || true)
+  if [[ -z $blob ]]; then
+    warn "could not read the model blob digest from 'ollama show --modelfile' — verify by hand against OLLAMA_MODEL_BLOB_SHA256"
+  elif [[ $blob == "$OLLAMA_MODEL_BLOB_SHA256" ]]; then
+    ok "$OLLAMA_MODEL weights match the pinned digest (${blob:0:12})"
+  else
+    fail "$OLLAMA_MODEL weights digest is $blob, expected $OLLAMA_MODEL_BLOB_SHA256 — the tag was repointed; review before use (ollama rm $OLLAMA_MODEL to re-pull)"
+  fi
   local t0 t1 resp
   t0=$(date +%s%N)
   resp=$(curl -s http://127.0.0.1:11434/api/chat -d "{\"model\":\"$OLLAMA_MODEL\",\"think\":false,\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}]}")
   t1=$(date +%s%N)
   echo "$resp" | jq -r '.message.content' | grep -qi ok && ok "model answers ($(( (t1-t0)/1000000 )) ms incl. first load)" || fail "unexpected reply: $resp"
+}
+
+voxtype_sig_ok() {
+  # Verify SHA256SUMS.txt.asc with a throwaway keyring holding ONLY the pinned key, and require
+  # that the signature was made by that fingerprint (a plain `gpg --verify` returns 0 for a good
+  # signature from ANY key in ~/.gnupg). Prints nothing; the return code is the answer.
+  command -v gpg >/dev/null || return 1
+  local kr="$DL/voxtype-signing-key.gpg" gnupg status
+  gnupg=$(mktemp -d) || return 1
+  if [[ ! -s $kr ]]; then
+    gpg --homedir "$gnupg" --batch --keyserver hkps://keys.openpgp.org --recv-keys "$VOXTYPE_GPG_KEY" >/dev/null 2>&1 \
+      && gpg --homedir "$gnupg" --batch --export "$VOXTYPE_GPG_KEY" > "$kr" || { rm -rf "$gnupg" "$kr"; return 1; }
+  fi
+  status=$(gpg --homedir "$gnupg" --batch --no-default-keyring --keyring "$kr" --status-fd 1 \
+             --verify "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt.asc" "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt" 2>/dev/null)
+  local rc=$?
+  rm -rf "$gnupg"
+  ((rc == 0)) && grep -q "^\[GNUPG:\] VALIDSIG $VOXTYPE_GPG_KEY " <<<"$status"
 }
 
 step_voxtype() {
@@ -311,14 +424,12 @@ step_voxtype() {
     fi
     fetch "$base/SHA256SUMS.txt"     "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt"
     fetch "$base/SHA256SUMS.txt.asc" "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt.asc"
-    if command -v gpg >/dev/null; then
-      gpg --list-keys "$VOXTYPE_GPG_KEY" >/dev/null 2>&1 || gpg --keyserver hkps://keys.openpgp.org --recv-keys "$VOXTYPE_GPG_KEY" \
-        || warn "could not fetch signing key from keys.openpgp.org"
-      if gpg --verify "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt.asc" "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt" 2>/dev/null; then
-        ok "SHA256SUMS.txt signature valid ($VOXTYPE_GPG_KEY)"
-      else
-        warn "GPG verification failed or key unavailable — falling back to sha256 only. Verify manually: gpg --verify $DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt.asc"
-      fi
+    if voxtype_sig_ok; then
+      ok "SHA256SUMS.txt signed by $VOXTYPE_GPG_KEY"
+    elif [[ $REQUIRE_GPG == 1 ]]; then
+      fail "could not verify the signature on SHA256SUMS.txt with key $VOXTYPE_GPG_KEY (gpg missing, keyserver unreachable, or bad signature). Fix that, or accept sha256-only with REQUIRE_GPG=0"
+    else
+      warn "REQUIRE_GPG=0: skipping signature check — sha256 list and binaries come from the same server, so this only detects corruption, not substitution"
     fi
     local f
     for f in "${files[@]}"; do fetch "$base/$f" "$DL/$f"; done
@@ -353,12 +464,26 @@ EOF
 }
 
 step_model() {
-  step "Parakeet TDT 0.6B v3 (ONNX, data-only format)"
+  step "Parakeet TDT 0.6B v3 (ONNX, rev ${PARAKEET_REV:0:8}, every file digest-checked)"
   mkdir -p "$MODEL_DIR"
-  local f
-  for f in encoder-model.onnx encoder-model.onnx.data decoder_joint-model.onnx vocab.txt config.json; do
-    if [[ -s "$MODEL_DIR/$f" ]]; then ok "$f"; else
+  local f have want
+  # The ONNX files are parsed and executed by ONNX Runtime inside the daemon that owns the
+  # microphone, so they are treated like binaries: fetched from a fixed commit and checked
+  # against digests recorded in this script. A file that fails the check is deleted.
+  for f in "${!PARAKEET_SHA256[@]}" "${!PARAKEET_GITBLOB[@]}"; do
+    if [[ ! -s "$MODEL_DIR/$f" ]]; then
       echo "  fetching $f"; fetch "$PARAKEET_REPO/$f" "$MODEL_DIR/$f"
+    fi
+    if [[ -n ${PARAKEET_SHA256[$f]:-} ]]; then
+      want=${PARAKEET_SHA256[$f]}; have=$(sha256sum "$MODEL_DIR/$f" | cut -d' ' -f1)
+    else
+      want=${PARAKEET_GITBLOB[$f]}; have=$(git hash-object "$MODEL_DIR/$f")
+    fi
+    if [[ $have == "$want" ]]; then
+      ok "$f (${have:0:12})"
+    else
+      rm -f "$MODEL_DIR/$f"
+      fail "$f digest mismatch (have $have, want $want) — file removed; re-run to fetch again, or update the pin if the model was intentionally changed"
     fi
   done
   du -sh "$MODEL_DIR" | sed 's/^/  /'
@@ -368,10 +493,27 @@ step_config() {
   step "config + hooks  (mode: $HOTKEY_MODE)"
   mkdir -p "$BIN" "$DICTATE_DIR" "$VOX_CFG_DIR" "$LOG_DIR"
   chmod 700 "$DICTATE_DIR" "$LOG_DIR"
+  echo "$HOTKEY_MODE" > "$MODE_STAMP"
   chmod +x "$REPO/polish.py" "$REPO/dictate" "$REPO/tests/latency_report.py"
-  ln -sfn "$REPO/polish.py" "$BIN/polish.py"
-  ln -sfn "$REPO/dictate"   "$BIN/dictate"
-  ok "symlinked polish.py and dictate into $BIN"
+  chmod go-w "$REPO" "$REPO/polish.py" "$REPO/dictate" 2>/dev/null || true
+  # The hook runs with your full privileges on every dictation. Install a COPY so that what
+  # runs is what you reviewed at install time, not whatever `git pull` brings in later.
+  # DEV_SYMLINK=1 restores the symlink for prompt/pipeline tuning sessions.
+  if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "  repo: $(git -C "$REPO" rev-parse --short HEAD) $(git -C "$REPO" status --porcelain | grep -q . && echo '(uncommitted changes!)' || echo '(clean)')"
+  fi
+  if [[ ${DEV_SYMLINK:-0} == 1 ]]; then
+    ln -sfn "$REPO/polish.py" "$BIN/polish.py"
+    ln -sfn "$REPO/dictate"   "$BIN/dictate"
+    ln -sfn "$REPO/tests/latency_report.py" "$BIN/dictate_latency_report.py"
+    warn "DEV_SYMLINK=1: $BIN/polish.py is a symlink into the repo — edits there run live"
+  else
+    rm -f "$BIN/polish.py" "$BIN/dictate" "$BIN/dictate_latency_report.py"
+    install -m 0755 "$REPO/polish.py" "$BIN/polish.py"
+    install -m 0755 "$REPO/dictate"   "$BIN/dictate"
+    install -m 0755 "$REPO/tests/latency_report.py" "$BIN/dictate_latency_report.py"
+    ok "installed copies of polish.py and dictate into $BIN (re-run './install.sh config' after editing them)"
+  fi
   local f
   for f in prompt.md corrections.json snippets.json jargon.txt settings.json; do
     if [[ -e "$DICTATE_DIR/$f" ]]; then ok "$f exists (kept)"; else cp "$REPO/config/$f" "$DICTATE_DIR/$f"; ok "$f installed"; fi
@@ -379,10 +521,11 @@ step_config() {
   local src="$REPO/config/voxtype.config.toml"
   [[ $HOTKEY_MODE == toggle ]] && src="$REPO/config/voxtype.config.toggle.toml"
   local cfg="$VOX_CFG_DIR/config.toml"
-  if [[ -e $cfg ]] && ! sed "s#/home/pitipatw#$HOME#g" "$src" | cmp -s - "$cfg"; then
+  local rendered; rendered=$(<"$src"); rendered=${rendered//\/home\/pitipatw/"$HOME"}   # quoted: bash 5.2 would expand & in an unquoted replacement
+  if [[ -e $cfg ]] && ! cmp -s <(printf '%s\n' "$rendered") "$cfg"; then
     cp "$cfg" "$cfg.bak.$(date +%s)"; warn "existing config.toml backed up"
   fi
-  sed "s#/home/pitipatw#$HOME#g" "$src" > "$cfg"
+  printf '%s\n' "$rendered" > "$cfg"
   chmod 600 "$cfg"
   ok "wrote $cfg"
   printf 'um so uh this is a test of the polish hook with enough words' | "$BIN/polish.py" >/dev/null && ok "polish.py runs end to end (see: dictate log tail 1)"
@@ -424,6 +567,9 @@ step_summary() {
   5. Mic-in-use check: run  pw-top  and confirm a voxtype capture stream exists ONLY while recording
   6. After ~20 dictations: dictate log stats
   Logs: journalctl --user -u voxtype -f   |   dictate log tail   |   dictate log purge
+  Text logging is OFF by default ("log_text": true in ~/.config/dictate/settings.json turns it on).
+  Newlines are OFF by default ("allow_newlines": true keeps "new line"/"new paragraph"; never in terminals).
+  Mode '$HOTKEY_MODE' is remembered in $MODE_STAMP; pass HOTKEY_MODE=... to change it.
 EOF
 }
 
