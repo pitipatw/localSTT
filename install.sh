@@ -34,7 +34,7 @@ DICTATE_DIR="$HOME/.config/dictate"
 VOX_CFG_DIR="$HOME/.config/voxtype"
 MODEL_DIR="$HOME/.local/share/voxtype/models/parakeet-tdt-0.6b-v3"
 LOG_DIR="$HOME/.local/share/dictate"
-DL="$HOME/.cache/localtts-downloads"
+DL="$HOME/.cache/localstt-downloads"
 NEED_RELOGIN=0
 mkdir -p "$DL"
 
@@ -238,13 +238,13 @@ step_ollama() {
     sudo useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
   fi
   local unit=/etc/systemd/system/ollama.service
-  if [[ -f $unit ]] && ! grep -q '^# managed by localTTS' "$unit"; then   # foreign unit: back up before replacing
+  if [[ -f $unit ]] && ! grep -q '^# managed by localSTT' "$unit"; then   # foreign unit: back up before replacing
     sudo cp "$unit" "$unit.bak.$(date +%s)"
     warn "replacing pre-existing $unit (backup kept) so the service runs the verified binary bound to 127.0.0.1"
   fi
-  if [[ ! -f $unit ]] || ! grep -q '^# managed by localTTS v2' "$unit"; then
+  if [[ ! -f $unit ]] || ! grep -q '^# managed by localSTT v2' "$unit"; then
     sudo tee "$unit" >/dev/null <<'EOF'
-# managed by localTTS v2 (install.sh) — keeps the cleanup model resident in VRAM so the
+# managed by localSTT v2 (install.sh) — keeps the cleanup model resident in VRAM so the
 # first dictation after idle does not hit the hook's 4 s timeout.
 [Unit]
 Description=Ollama (local LLM server)

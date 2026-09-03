@@ -27,7 +27,7 @@ fallback_to_clipboard = true
 driver_order = ["ydotool", "clipboard"]   # never wtype/eitype on COSMIC (types digits instead of text)
 
 [output.post_process]
-command = "/home/pitipatw/.local/bin/polish.py"   # symlink -> ~/dev/localTTS/polish.py
+command = "/home/pitipatw/.local/bin/polish.py"   # symlink -> ~/dev/localSTT/polish.py
 timeout_ms = 6000                                 # polish.py itself gives up on Ollama after 4 s
 
 [osd]

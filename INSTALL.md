@@ -1,6 +1,6 @@
 # Installation Guide — local dictation on Pop!_OS COSMIC
 
-This guide walks through installing the stack in `~/dev/localTTS` and, alongside each step, explains what it changes on your system and what the security implications are. Read §1 before running anything; it contains the one decision you need to make.
+This guide walks through installing the stack in `~/dev/localSTT` and, alongside each step, explains what it changes on your system and what the security implications are. Read §1 before running anything; it contains the one decision you need to make.
 
 Everything runs locally. No audio, text, or telemetry leaves the machine at any point after installation. The installation itself downloads four things from the internet: Voxtype, Ollama, the Parakeet speech model, and the Qwen3 language model.
 
@@ -41,7 +41,7 @@ The push-to-talk trade is what most people running evdev dictation on Wayland ac
 | Parakeet TDT 0.6B v3 (ONNX) | Hugging Face, `istupakov/parakeet-tdt-0.6b-v3-onnx` | None (no checksums published) | ONNX is a protobuf data format; it cannot execute code when loaded. Worst case is a bad model, not a compromised machine. |
 | `qwen3:8b` | Ollama registry | Ollama verifies its own manifests by digest | GGUF is a data format; same reasoning. |
 | apt packages (`ydotool ydotoold wl-clipboard jq zstd gnupg python3-pytest`) | Pop!_OS repos | apt signature checking | Same trust as the rest of your system. |
-| ydotool 1.0.4 source (only if no `ydotoold` package is available) | GitHub, `ReimuNotMoe/ydotool`, pinned tag `v1.0.4` | git tag; the commit hash is printed at build time | Small C project you compile yourself; you can read it in `~/.cache/localtts-downloads/ydotool-1.0.4`. |
+| ydotool 1.0.4 source (only if no `ydotoold` package is available) | GitHub, `ReimuNotMoe/ydotool`, pinned tag `v1.0.4` | git tag; the commit hash is printed at build time | Small C project you compile yourself; you can read it in `~/.cache/localstt-downloads/ydotool-1.0.4`. |
 
 Versions are pinned at the top of `install.sh`. To upgrade, change the version, and the checksum step will verify the new release.
 
@@ -77,7 +77,7 @@ Run in a terminal, in order. `install.sh` is idempotent: re-running it skips wha
 **Step 1 — make scripts executable, start a repo**
 
 ```bash
-cd ~/dev/localTTS
+cd ~/dev/localSTT
 chmod +x install.sh polish.py dictate tests/latency_report.py
 git init && git add -A && git commit -m "initial dictation stack"
 ```
@@ -92,14 +92,14 @@ HOTKEY_MODE=toggle ./install.sh    # toggle mode (adds you to `uinput` only)
 
 It asks for your sudo password for: apt installs, the `/dev/uinput` udev rule, the group change, extracting Ollama to `/usr/local`, and creating the `ollama` user and system service. Everything else is under your home directory. Each `==` section ends with green ✔ lines; a yellow `!` is informational; a red ✘ stops the run and says why.
 
-The slow parts are the Parakeet download (~2.5 GB) and `ollama pull qwen3:8b` (~5 GB). Downloads are cached in `~/.cache/localtts-downloads` so a re-run does not fetch them again.
+The slow parts are the Parakeet download (~2.5 GB) and `ollama pull qwen3:8b` (~5 GB). Downloads are cached in `~/.cache/localstt-downloads` so a re-run does not fetch them again.
 
 **Step 3 — log out and back in**
 
 The first run adds you to a group; that only takes effect for a new login session (a new terminal is not enough). The summary at the end says whether this is needed. After logging back in:
 
 ```bash
-cd ~/dev/localTTS && ./install.sh
+cd ~/dev/localSTT && ./install.sh
 ```
 
 This time the ydotool step should print `✔ ydotoold running`.
@@ -107,7 +107,7 @@ This time the ydotool step should print `✔ ydotoold running`.
 **Step 4 — verify the downloads yourself (optional, recommended once)**
 
 ```bash
-cd ~/.cache/localtts-downloads
+cd ~/.cache/localstt-downloads
 gpg --verify voxtype-1.0.1.SHA256SUMS.txt.asc voxtype-1.0.1.SHA256SUMS.txt
 sha256sum -c --ignore-missing voxtype-1.0.1.SHA256SUMS.txt
 sha256sum -c --ignore-missing ollama-0.33.2.sha256sum.txt
@@ -176,7 +176,7 @@ Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture str
 | `~/.local/share/voxtype/models/` | Parakeet | `rm -rf` |
 | `~/.config/voxtype/config.toml`, `~/.config/dictate/`, `~/.config/systemd/user/{ydotool,voxtype}.service*`, `~/.config/environment.d/ydotool.conf`, `~/.profile` (one `export YDOTOOL_SOCKET` line) | config | `systemctl --user disable --now voxtype ydotool`, then delete |
 | `~/.local/share/dictate/log.jsonl` | dictation log | `dictate log purge` |
-| `~/.cache/localtts-downloads/` | verified downloads | `rm -rf` |
+| `~/.cache/localstt-downloads/` | verified downloads | `rm -rf` |
 
 ---
 
@@ -207,7 +207,7 @@ Related, found on the same path: Electron also needs more than ydotool's default
 | Paste lands in the wrong window | Disable any Voxtype OSD/overlay. |
 | `[llm_error]` in `dictate test` | `systemctl status ollama`, `ss -ltn \| grep 11434`, `ollama list` |
 | Transcription slow (~1 s+) | GPU fallback to CPU; see step 9. |
-| Checksum mismatch | Delete `~/.cache/localtts-downloads/*` and re-run. If it persists, do not install — the release may have been re-uploaded or tampered with; compare against the GitHub release page. |
+| Checksum mismatch | Delete `~/.cache/localstt-downloads/*` and re-run. If it persists, do not install — the release may have been re-uploaded or tampered with; compare against the GitHub release page. |
 | Hotkey ignored in push-to-talk | `id -nG \| grep input`; `journalctl --user -u voxtype` for "permission denied" on `/dev/input`; `evtest` to confirm the key's evdev name matches `key = …` |
 | Pastes in GTK apps but not Electron (Claude, VS Code) | Hotkey is a modifier key → §5. Also check `type_delay_ms = 60`. |
 | `4114` (or other digits) typed instead of a paste | ydotool client is pre-1.0 → §5; `./install.sh ydotool` builds 1.0.4. |

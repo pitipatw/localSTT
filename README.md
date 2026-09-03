@@ -1,4 +1,4 @@
-# localTTS
+# localSTT
 
 Local, offline push-to-talk dictation for Linux (Pop!_OS + COSMIC on Wayland). Hold a key, speak, release: a cleaned-up transcript is pasted at the cursor about a second later. A replacement for Wispr Flow with no cloud, no account, no subscription — nothing leaves the machine.
 
@@ -38,8 +38,8 @@ hold F13 ──evdev──▶ Voxtype daemon ── records mic (PipeWire) ─�
 Read **[INSTALL.md](INSTALL.md)** first — its §1 covers the security trade-offs (the `input` group, supply chain, the plaintext dictation log) and the one decision you have to make. Short version:
 
 ```bash
-git clone git@github.com:pitipatw/localTTS.git ~/dev/localTTS
-cd ~/dev/localTTS
+git clone git@github.com:pitipatw/localSTT.git ~/dev/localSTT
+cd ~/dev/localSTT
 chmod +x install.sh polish.py dictate tests/latency_report.py
 ./install.sh                     # or: HOTKEY_MODE=toggle ./install.sh
 # log out and back in when it says so, then ./install.sh again
@@ -62,7 +62,7 @@ Before the first dictation, remap a spare physical key to **F13** in your keyboa
 ## Repository layout
 
 ```
-localTTS/
+localSTT/
 ├── README.md                    this file
 ├── INSTALL.md                   installation guide, security model, troubleshooting
 ├── local-dictation-handoff.md   original design doc (Sept 2026)
