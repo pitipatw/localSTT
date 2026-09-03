@@ -16,7 +16,7 @@ The realistic microphone threat is a compromised user account, and that threat e
 
 ### 1.2 The `input` group — the one real trade-off
 
-Wayland's security model keeps applications from seeing each other's keystrokes. Voxtype's hold-to-talk needs to see the Right Ctrl press *and release* no matter which window is focused, and the only way to do that on COSMIC is to read the keyboard at the evdev level, which requires your user to be in the `input` group.
+Wayland's security model keeps applications from seeing each other's keystrokes. Voxtype's hold-to-talk needs to see the dictation key's press *and release* no matter which window is focused, and the only way to do that on COSMIC is to read the keyboard at the evdev level, which requires your user to be in the `input` group.
 
 Being in `input` means **every process running as you can read every keystroke** from `/dev/input/event*` — a user-level keylogger no longer needs root and can capture passwords typed into terminals, browsers, or sudo prompts. It also grants write access to `/dev/uinput` (needed for pasting), which lets any user process inject keystrokes.
 
@@ -24,7 +24,7 @@ You have two choices:
 
 | | Push-to-talk (default) | Toggle mode (`HOTKEY_MODE=toggle`) |
 |---|---|---|
-| Feel | Hold Right Ctrl, speak, release | Press shortcut, speak, press again |
+| Feel | Hold the F13 key, speak, release | Press shortcut, speak, press again |
 | Group added | `input` (read all keyboards + uinput) | `uinput` only (inject, cannot read keyboard) |
 | Hotkey mechanism | Voxtype evdev listener | COSMIC custom shortcut → `voxtype record toggle` |
 | Keylogger exposure | any user process can read keystrokes | unchanged from stock Wayland |
@@ -40,7 +40,8 @@ The push-to-talk trade is what most people running evdev dictation on Wayland ac
 | Ollama 0.33.2 tarball | GitHub release, pinned version | SHA256 against the release's `sha256sum.txt` | GitHub and the Ollama project. **No `curl \| sh`**: the tarball is extracted to `/usr/local` and a systemd unit is written by this repo, bound to `127.0.0.1` only, running as a dedicated `ollama` system user. |
 | Parakeet TDT 0.6B v3 (ONNX) | Hugging Face, `istupakov/parakeet-tdt-0.6b-v3-onnx` | None (no checksums published) | ONNX is a protobuf data format; it cannot execute code when loaded. Worst case is a bad model, not a compromised machine. |
 | `qwen3:8b` | Ollama registry | Ollama verifies its own manifests by digest | GGUF is a data format; same reasoning. |
-| apt packages (`ydotool wl-clipboard jq zstd gnupg python3-pytest`) | Pop!_OS repos | apt signature checking | Same trust as the rest of your system. |
+| apt packages (`ydotool ydotoold wl-clipboard jq zstd gnupg python3-pytest`) | Pop!_OS repos | apt signature checking | Same trust as the rest of your system. |
+| ydotool 1.0.4 source (only if no `ydotoold` package is available) | GitHub, `ReimuNotMoe/ydotool`, pinned tag `v1.0.4` | git tag; the commit hash is printed at build time | Small C project you compile yourself; you can read it in `~/.cache/localtts-downloads/ydotool-1.0.4`. |
 
 Versions are pinned at the top of `install.sh`. To upgrade, change the version, and the checksum step will verify the new release.
 
@@ -65,6 +66,7 @@ The ydotool socket is created mode `0600`, so only your user can inject through 
 - About 10 GB free: Parakeet ~2.5 GB, Qwen3-8B ~5 GB, Voxtype ~0.5 GB.
 - ~12 GB VRAM is comfortable; both models stay resident (~7 GB).
 - Decide push-to-talk vs toggle (§1.2).
+- **Pick a non-modifier dictation key.** The config uses `F13`. Remap a spare physical key to F13 in your keyboard's firmware tool (VIA/QMK: Configure → layer 0 → click the key → choose F13), then confirm with `evtest` that Linux reports `KEY_F13` (code 183). Do not use Ctrl/Alt/Shift/Super: a bare modifier press-and-release leaves Electron apps (Claude, VS Code, Slack, Discord) with stale modifier state, and the paste keystroke that follows is silently ignored there. If your keyboard cannot be remapped, `PAUSE` or `SCROLLLOCK` are the next best choices.
 
 ---
 
@@ -137,7 +139,7 @@ Expect `[llm]` and something like `final: Send it Friday.` If you see `[llm_erro
 
 **Step 8 — first dictation**
 
-Click into the text editor. Push-to-talk: hold Right Ctrl, say "testing one two three", release. Toggle: press your shortcut, speak, press again. Text should appear in about a second. If nothing happens, run `journalctl --user -u voxtype -f` in another terminal and try again. Common causes: the daemon is not running (`systemctl --user status voxtype`), the hotkey is not seen (group membership not yet active — did you log out?), or the paste landed in another window (an overlay stole focus — keep any OSD disabled).
+Click into the text editor. Push-to-talk: hold the F13 key, say "testing one two three", release. Toggle: press your shortcut, speak, press again. Text should appear in about a second. If nothing happens, run `journalctl --user -u voxtype -f` in another terminal and try again. Common causes: the daemon is not running (`systemctl --user status voxtype`), the hotkey is not seen (group membership not yet active — did you log out?), or the paste landed in another window (an overlay stole focus — keep any OSD disabled).
 
 **Step 9 — GPU check**
 
@@ -181,6 +183,7 @@ Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture str
 | Symptom | Check |
 |---|---|
 | `ydotoold not running` on first run | Expected before re-login. Log out/in, re-run. |
+| `status=203/EXEC` or `ydotoold binary not found` | Debian/Ubuntu split the daemon into a separate `ydotoold` package; the `ydotool` package is only the client. The installer installs `ydotoold` via apt, or builds ydotool 1.0.4 from source into `~/.local/bin` if the package is unavailable. |
 | `ydotool key` does nothing | `ls -l /dev/uinput` group matches your mode; `id -nG` includes it; `echo $YDOTOOL_SOCKET` matches `systemctl --user show ydotool -p ExecStart` |
 | Text comes out as digits | A `wtype`/`eitype` driver got used. `driver_order` must start with `ydotool`. |
 | Paste lands in the wrong window | Disable any Voxtype OSD/overlay. |

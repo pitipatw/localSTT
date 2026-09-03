@@ -15,12 +15,14 @@
 #     and installing Ollama under /usr/local with its own system user.
 
 set -euo pipefail
+trap 'printf "  \033[31m✘\033[0m unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 # ---- pinned versions -------------------------------------------------------
 VOXTYPE_VERSION="1.0.1"
 VOXTYPE_GPG_KEY="9CCF7915B750CAE8B095ED1AA3FC9F33FD209279"   # from the release notes
 OLLAMA_VERSION="0.33.2"
 OLLAMA_MODEL="qwen3:8b"
+YDOTOOL_VERSION="1.0.4"        # only used if the distro package lacks ydotoold
 PARAKEET_REPO="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
 # ---------------------------------------------------------------------------
 
@@ -52,6 +54,27 @@ case "$HOTKEY_MODE" in
   *) fail "HOTKEY_MODE must be push_to_talk or toggle" ;;
 esac
 
+build_ydotool() {
+  # Source build of ReimuNotMoe/ydotool at a pinned tag. Installs ydotool + ydotoold
+  # into ~/.local/bin (takes precedence over /usr/bin when ~/.local/bin is first in PATH).
+  local need=() p
+  for p in cmake build-essential git scdoc; do dpkg -s "$p" >/dev/null 2>&1 || need+=("$p"); done
+  ((${#need[@]})) && sudo apt-get install -y "${need[@]}"
+  local src="$DL/ydotool-$YDOTOOL_VERSION"
+  if [[ ! -d $src/.git ]]; then
+    git clone --depth 1 --branch "v$YDOTOOL_VERSION" https://github.com/ReimuNotMoe/ydotool "$src"
+  fi
+  echo "  source: $(git -C "$src" rev-parse HEAD) (tag v$YDOTOOL_VERSION)"
+  cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local" >/dev/null
+  cmake --build "$src/build" -j"$(nproc)" >/dev/null
+  # not `cmake --install`: it also tries to drop a unit into /usr/lib/systemd (needs root; we have our own unit)
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$src/build/ydotool" "$src/build/ydotoold" "$HOME/.local/bin/"
+  [[ -x "$HOME/.local/bin/ydotoold" && -x "$HOME/.local/bin/ydotool" ]] || fail "ydotool build failed — see $src/build"
+  ok "built ydotool $YDOTOOL_VERSION → $HOME/.local/bin/{ydotool,ydotoold}"
+  case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "$HOME/.local/bin is not on PATH; add it to ~/.profile" ;; esac
+}
+
 # ----------------------------------------------------------------------------
 step_preflight() {
   step "preflight  (mode: $HOTKEY_MODE, uinput group: $UINPUT_GROUP)"
@@ -68,14 +91,22 @@ step_preflight() {
 
 step_apt() {
   step "apt packages"
-  local pkgs=(ydotool wl-clipboard curl jq zstd gnupg python3 python3-pytest)
+  # Debian/Ubuntu split ydotool into `ydotool` (client) and `ydotoold` (daemon).
+  local pkgs=(ydotool ydotoold wl-clipboard curl jq zstd gnupg python3 python3-pytest)
   local missing=()
   for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
   if ((${#missing[@]})); then
     sudo apt-get update -qq
-    sudo apt-get install -y "${missing[@]}"
+    sudo apt-get install -y "${missing[@]}" || {
+      warn "some packages failed to install; retrying without ydotoold (will build it from source instead)"
+      sudo apt-get install -y "${missing[@]/ydotoold/}"
+    }
   fi
-  for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 && ok "$p" || fail "$p not installed"; done
+  for p in "${pkgs[@]}"; do
+    if dpkg -s "$p" >/dev/null 2>&1; then ok "$p"
+    elif [[ $p == ydotoold ]]; then warn "ydotoold package unavailable — the ydotool step will build it from source"
+    else fail "$p not installed"; fi
+  done
 }
 
 step_ydotool() {
@@ -107,54 +138,112 @@ step_ydotool() {
   ls -l /dev/uinput | sed 's/^/  /'
 
   mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/environment.d"
-  if ! systemctl --user cat ydotool >/dev/null 2>&1; then
-    cp "$REPO/systemd/ydotool.service" "$HOME/.config/systemd/user/ydotool.service"
-    systemctl --user daemon-reload
-    ok "installed user unit from repo"
+  local sock daemon
+
+  # Case A: the distro runs ydotoold as a SYSTEM service (root). Use it as-is.
+  if systemctl is-active ydotool >/dev/null 2>&1; then
+    sock=$(systemctl show ydotool -p ExecStart --value | grep -o -- '--socket-path=[^ ]*' | cut -d= -f2 || true)
+    [[ -z $sock ]] && sock="/tmp/.ydotool_socket"
+    ok "distro system ydotool.service is running (socket $sock); not installing a user unit"
+    systemctl --user disable --now ydotool >/dev/null 2>&1 || true
   else
-    ok "ydotool user unit already available"
+    # Case B: our user unit. Locate the daemon binary — packages differ on where it lives.
+    # Voxtype drives ydotool with 1.0-style numeric args ("42:1 110:1 …"); a pre-1.0 client
+    # types those literally (you see "4114" instead of a paste). Build 1.0.x if the package is older.
+    local pkgver
+    pkgver=$(dpkg-query -W -f='${Version}' ydotool 2>/dev/null || echo 0)
+    if [[ ${YDOTOOL_FROM_SOURCE:-0} == 1 ]] || ! dpkg --compare-versions "$pkgver" ge 1.0; then
+      warn "packaged ydotool is $pkgver (< 1.0) — building $YDOTOOL_VERSION from source so Voxtype's key syntax works"
+      build_ydotool
+    fi
+    daemon=$(command -v ydotoold 2>/dev/null || true)
+    [[ -x "$HOME/.local/bin/ydotoold" ]] && daemon="$HOME/.local/bin/ydotoold"
+    [[ -z $daemon ]] && daemon=$(ls /usr/libexec/ydotoold /usr/sbin/ydotoold /usr/lib/ydotool/ydotoold /usr/local/bin/ydotoold 2>/dev/null | head -1 || true)
+    [[ -z $daemon ]] && daemon=$(dpkg -L ydotool 2>/dev/null | grep -E '/ydotoold$' | head -1 || true)
+    if [[ -z $daemon || ! -x $daemon ]] && apt-cache show ydotoold >/dev/null 2>&1; then
+      sudo apt-get install -y ydotoold && daemon=$(command -v ydotoold 2>/dev/null || true)
+    fi
+    if [[ -z $daemon || ! -x $daemon ]]; then
+      warn "no ydotoold package available — building ydotool $YDOTOOL_VERSION from source into $HOME/.local"
+      build_ydotool
+      daemon="$HOME/.local/bin/ydotoold"
+    fi
+    ok "ydotoold at $daemon"
+    local unit="$HOME/.config/systemd/user/ydotool.service"
+    if [[ ! -f $unit ]] || ! grep -q "^ExecStart=$daemon" "$unit"; then
+      sed "s#^ExecStart=/usr/bin/ydotoold#ExecStart=$daemon#" "$REPO/systemd/ydotool.service" > "$unit"
+      systemctl --user daemon-reload
+      ok "wrote user unit ($unit)"
+    else
+      ok "user unit up to date"
+    fi
+    systemctl --user reset-failed ydotool >/dev/null 2>&1 || true
+    systemctl --user enable ydotool >/dev/null 2>&1 || true
+    systemctl --user restart ydotool || true
+    sleep 1
+    # Some builds ignore --socket-path; trust what the daemon says it did.
+    sock=$(journalctl --user -u ydotool --since "-30s" --no-pager 2>/dev/null \
+           | grep -o 'listening on socket [^ ]*' | tail -1 | awk '{print $NF}' || true)
+    if [[ -z $sock ]]; then
+      sock=$(systemctl --user show ydotool -p ExecStart --value | grep -o -- '--socket-path=[^ ]*' | cut -d= -f2 || true)
+      sock="${sock//%t/$XDG_RUNTIME_DIR}"
+    fi
+    [[ -z $sock ]] && sock="/tmp/.ydotool_socket"
   fi
-  systemctl --user enable ydotool >/dev/null 2>&1 || true
-  systemctl --user restart ydotool || true
-  sleep 0.5
-  local sock
-  sock=$(systemctl --user show ydotool -p ExecStart --value | grep -o -- '--socket-path=[^ ]*' | cut -d= -f2 || true)
-  sock="${sock//%t/$XDG_RUNTIME_DIR}"
-  [[ -z $sock ]] && sock="/tmp/.ydotool_socket"
+
   echo "YDOTOOL_SOCKET=$sock" > "$HOME/.config/environment.d/ydotool.conf"
-  grep -q YDOTOOL_SOCKET "$HOME/.profile" 2>/dev/null || echo "export YDOTOOL_SOCKET=\"$sock\"" >> "$HOME/.profile"
+  sed -i '/YDOTOOL_SOCKET/d' "$HOME/.profile" 2>/dev/null || true
+  echo "export YDOTOOL_SOCKET=\"$sock\"" >> "$HOME/.profile"
   export YDOTOOL_SOCKET="$sock"
-  if systemctl --user is-active ydotool >/dev/null; then
+
+  if systemctl is-active ydotool >/dev/null 2>&1 || systemctl --user is-active ydotool >/dev/null 2>&1; then
     ok "ydotoold running, socket $sock"
+    if [[ -S $sock ]]; then
+      ls -l "$sock" | sed 's/^/  /'
+      [[ "$(stat -c %a "$sock")" == "600" ]] || warn "socket is not mode 600 — other local users could inject keystrokes; consider a system-wide multi-user review"
+    else
+      warn "socket $sock not present — check: journalctl --user -u ydotool -n 5"
+    fi
   elif ((NEED_RELOGIN)); then
     warn "ydotoold cannot open /dev/uinput until you log out and back in — expected on first run; continuing"
   else
-    journalctl --user -u ydotool -n 10 --no-pager | sed 's/^/  /'
-    fail "ydotoold not running (see log above). Check: id -nG | grep $UINPUT_GROUP ; ls -l /dev/uinput ; which ydotoold"
+    journalctl --user -u ydotool -n 6 --no-pager | sed 's/^/  /'
+    fail "ydotoold not running (see log above). Show me: dpkg -L ydotool ; id -nG ; ls -l /dev/uinput"
   fi
 }
 
 step_ollama() {
   step "Ollama $OLLAMA_VERSION + $OLLAMA_MODEL  (pinned tarball, sha256-verified, no curl|sh)"
-  if ! command -v ollama >/dev/null || [[ "$(ollama --version 2>/dev/null | grep -o '[0-9.]*$')" != "$OLLAMA_VERSION" ]]; then
+  local marker="$DL/ollama-$OLLAMA_VERSION.installed"
+  if [[ -f $marker && -x /usr/local/bin/ollama ]]; then
+    ok "ollama $OLLAMA_VERSION already extracted to /usr/local"
+  else
     local base="https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION"
     fetch "$base/ollama-linux-amd64.tar.zst" "$DL/ollama-$OLLAMA_VERSION.tar.zst"
     fetch "$base/sha256sum.txt"              "$DL/ollama-$OLLAMA_VERSION.sha256sum.txt"
     local want have
-    want=$(grep ' ollama-linux-amd64.tar.zst$' "$DL/ollama-$OLLAMA_VERSION.sha256sum.txt" | awk '{print $1}')
+    # checksum lines look like "<hash>  ./ollama-linux-amd64.tar.zst" (path prefix and binary-mode '*' both tolerated)
+    want=$(grep -E '[ */]ollama-linux-amd64\.tar\.zst$' "$DL/ollama-$OLLAMA_VERSION.sha256sum.txt" | awk '{print $1}' | head -1 || true)
     have=$(sha256sum "$DL/ollama-$OLLAMA_VERSION.tar.zst" | awk '{print $1}')
-    [[ -n $want && $want == "$have" ]] || fail "ollama tarball checksum mismatch (want $want, have $have) — delete $DL/ollama-* and retry"
+    [[ -n $want ]] || fail "could not find ollama-linux-amd64.tar.zst in sha256sum.txt — show me: cat $DL/ollama-$OLLAMA_VERSION.sha256sum.txt"
+    [[ $want == "$have" ]] || fail "ollama tarball checksum mismatch (want $want, have $have) — delete $DL/ollama-* and retry"
     ok "sha256 verified"
     sudo tar -C /usr/local --zstd -xf "$DL/ollama-$OLLAMA_VERSION.tar.zst"
-    ok "installed to /usr/local/bin/ollama"
-  else
-    ok "ollama $OLLAMA_VERSION present"
+    touch "$marker"
+    ok "extracted to /usr/local/bin/ollama"
   fi
   if ! id ollama >/dev/null 2>&1; then
     sudo useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
   fi
-  if [[ ! -f /etc/systemd/system/ollama.service ]]; then
-    sudo tee /etc/systemd/system/ollama.service >/dev/null <<'EOF'
+  local unit=/etc/systemd/system/ollama.service
+  if [[ -f $unit ]] && ! grep -q '^# managed by localTTS' "$unit"; then   # foreign unit: back up before replacing
+    sudo cp "$unit" "$unit.bak.$(date +%s)"
+    warn "replacing pre-existing $unit (backup kept) so the service runs the verified binary bound to 127.0.0.1"
+  fi
+  if [[ ! -f $unit ]] || ! grep -q '^# managed by localTTS v2' "$unit"; then
+    sudo tee "$unit" >/dev/null <<'EOF'
+# managed by localTTS v2 (install.sh) — keeps the cleanup model resident in VRAM so the
+# first dictation after idle does not hit the hook's 4 s timeout.
 [Unit]
 Description=Ollama (local LLM server)
 After=network-online.target
@@ -166,6 +255,7 @@ Group=ollama
 Restart=always
 RestartSec=3
 Environment="OLLAMA_HOST=127.0.0.1:11434"
+Environment="OLLAMA_KEEP_ALIVE=-1"
 Environment="HOME=/usr/share/ollama"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -174,9 +264,15 @@ WantedBy=multi-user.target
 EOF
     sudo systemctl daemon-reload
   fi
-  sudo systemctl enable --now ollama
-  sleep 1
-  ss -ltn | grep -q '127.0.0.1:11434' && ok "listening on 127.0.0.1:11434 only" || warn "ollama not (yet) listening on 127.0.0.1:11434 — check: sudo journalctl -u ollama -n 20"
+  sudo systemctl enable ollama >/dev/null 2>&1
+  sudo systemctl restart ollama          # restart, not start: an older Ollama may already be running
+  local running=""
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    running=$(curl -s http://127.0.0.1:11434/api/version 2>/dev/null | jq -r '.version // empty' || true)
+    [[ -n $running ]] && break; sleep 1
+  done
+  [[ $running == "$OLLAMA_VERSION" ]] && ok "server running $running" || fail "server on :11434 reports version '${running:-none}', expected $OLLAMA_VERSION — sudo journalctl -u ollama -n 20"
+  ss -ltn | grep -q '127.0.0.1:11434' && ok "listening on 127.0.0.1:11434 only" || warn "not bound to 127.0.0.1:11434 — check: ss -ltn | grep 11434"
   ollama list 2>/dev/null | grep -q "^${OLLAMA_MODEL}" || ollama pull "$OLLAMA_MODEL"
   local t0 t1 resp
   t0=$(date +%s%N)
@@ -186,19 +282,30 @@ EOF
 }
 
 step_voxtype() {
-  step "Voxtype $VOXTYPE_VERSION  (onnx-cuda binary, sha256 + GPG verified)"
-  if [[ -x "$VOX_LIB/voxtype" ]] && "$VOX_LIB/voxtype" --version 2>/dev/null | grep -q "$VOXTYPE_VERSION"; then
-    ok "already installed: $("$VOX_LIB/voxtype" --version | head -1)"
+  # VOXTYPE_VARIANT=auto (default: cuda-12/13 by driver) | cpu (onnx-avx2, no GPU libs needed)
+  local want_variant="${VOXTYPE_VARIANT:-auto}"
+  step "Voxtype $VOXTYPE_VERSION  (variant: $want_variant, sha256 + GPG verified)"
+  local stamp="$VOX_LIB/.variant"
+  if [[ -x "$VOX_LIB/voxtype" ]] && "$VOX_LIB/voxtype" --version 2>/dev/null | grep -q "$VOXTYPE_VERSION" \
+     && [[ "$(cat "$stamp" 2>/dev/null)" == "$want_variant" ]]; then
+    ok "already installed: $("$VOX_LIB/voxtype" --version | head -1) ($(cat "$stamp"))"
   else
-    # cuda-13 build needs a driver that reports CUDA >= 13; otherwise cuda-12.
-    local cuda_major variant
-    cuda_major=$(nvidia-smi | grep -o 'CUDA Version: [0-9]*' | grep -o '[0-9]*$' || echo 12)
-    variant=$(( cuda_major >= 13 ? 13 : 12 ))
     local base="https://github.com/peteonrails/voxtype/releases/download/v$VOXTYPE_VERSION"
-    local stem="voxtype-$VOXTYPE_VERSION-linux-x86_64-onnx-cuda-$variant"
-    local files=("$stem" "$stem.libonnxruntime_providers_cuda.so" "$stem.libonnxruntime_providers_shared.so")
-    [[ $variant == 13 ]] && files+=("$stem.libonnxruntime.so.1.24.4")
-    echo "  variant: cuda-$variant (driver reports CUDA $cuda_major)"
+    local stem files=()
+    if [[ $want_variant == cpu ]]; then
+      stem="voxtype-$VOXTYPE_VERSION-linux-x86_64-onnx-avx2"
+      files=("$stem")
+      echo "  variant: onnx-avx2 (CPU only)"
+    else
+      # cuda-13 build needs a driver that reports CUDA >= 13; otherwise cuda-12.
+      local cuda_major variant
+      cuda_major=$(nvidia-smi | grep -o 'CUDA Version: [0-9]*' | grep -o '[0-9]*$' || echo 12)
+      variant=$(( cuda_major >= 13 ? 13 : 12 ))
+      stem="voxtype-$VOXTYPE_VERSION-linux-x86_64-onnx-cuda-$variant"
+      files=("$stem" "$stem.libonnxruntime_providers_cuda.so" "$stem.libonnxruntime_providers_shared.so")
+      [[ $variant == 13 ]] && files+=("$stem.libonnxruntime.so.1.24.4")
+      echo "  variant: cuda-$variant (driver reports CUDA $cuda_major)"
+    fi
     fetch "$base/SHA256SUMS.txt"     "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt"
     fetch "$base/SHA256SUMS.txt.asc" "$DL/voxtype-$VOXTYPE_VERSION.SHA256SUMS.txt.asc"
     if command -v gpg >/dev/null; then
@@ -216,9 +323,12 @@ step_voxtype() {
       | sed 's/^/  /' || fail "sha256 mismatch — delete $DL/voxtype-* and retry, or the release was tampered with"
     ok "sha256 verified for ${#files[@]} files"
     mkdir -p "$VOX_LIB" "$BIN"
+    rm -f "$VOX_LIB"/libonnxruntime*.so*          # no stale provider libs from another variant
     install -m 0755 "$DL/$stem" "$VOX_LIB/voxtype"
     for f in "${files[@]:1}"; do install -m 0644 "$DL/$f" "$VOX_LIB/${f#"$stem".}"; done
+    echo "$want_variant" > "$stamp"
     ok "installed to $VOX_LIB"
+    systemctl --user try-restart voxtype 2>/dev/null || true
   fi
   # wrapper so the CUDA provider .so files (and system CUDA/cuDNN libs) are found
   cat > "$BIN/voxtype" <<EOF
@@ -229,7 +339,9 @@ EOF
   chmod +x "$BIN/voxtype"
   command -v voxtype >/dev/null || fail "$BIN is not on PATH — add it and re-run"
   ok "$(voxtype --version 2>/dev/null | head -1)"
-  if ldconfig -p | grep -q 'libcudnn.so.9'; then
+  if [[ $want_variant == cpu ]]; then
+    ok "CPU build: no CUDA libraries needed"
+  elif ldconfig -p | grep -q 'libcudnn.so.9'; then
     ok "cuDNN 9 found (CUDA execution provider can load)"
   else
     warn "libcudnn.so.9 not found — Parakeet will run on CPU until cuDNN 9 + CUDA runtime libs are installed"

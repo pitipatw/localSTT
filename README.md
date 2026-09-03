@@ -1,6 +1,6 @@
 # localTTS — local, offline dictation for Pop!_OS COSMIC
 
-Hold **Right Ctrl**, speak, release → cleaned text is pasted at the cursor. Nothing leaves the machine.
+Hold the **dictation key** (a key remapped to F13 in the keyboard firmware), speak, release → cleaned text is pasted at the cursor. Nothing leaves the machine.
 
 Stack: [Voxtype](https://github.com/peteonrails/voxtype) (evdev push-to-talk, Parakeet TDT 0.6B v3 on CUDA, paste via ydotool) → `polish.py` hook (dictionary + snippets + Qwen3-8B cleanup through Ollama) → `shift+insert` paste with clipboard restore.
 
@@ -17,12 +17,13 @@ Stack: [Voxtype](https://github.com/peteonrails/voxtype) (evdev push-to-talk, Pa
 | Filler removal | LLM only | Voxtype strips um/uh/er/… itself before the hook; the LLM rule stays as a second pass. |
 | Whisper fallback | runtime fallback | Voxtype runs one engine at a time. v1 is Parakeet-only; switch `engine = "whisper"` in config if needed. |
 | Length guard | ±40 % | Asymmetric: reject if output grows > 30 % (invented text) or shrinks > 75 % (summarised). Self-corrections legitimately shrink text ~50–70 %. |
-| Hotkey | TBD | `RIGHTCTRL`. Exists on every keyboard, nothing binds it alone. Voxtype's evdev listener does not grab it, so the focused app also sees Ctrl held — harmless. |
+| Hotkey | TBD | `F13`, produced by remapping a spare key (was Right Ctrl) in VIA. Right Ctrl was tried first and failed in Electron apps: a bare modifier press/release leaves Chromium's modifier state stale, so the following shift+insert is read as Ctrl+Shift+Insert and ignored. A non-modifier key has no such side effects (and no accidental "." from a mod-tap). |
 | Keyboard layout / dotool | verify | Irrelevant: `shift+insert` is layout-independent. |
 | Voxtype install | "latest release" | Pinned to 1.0.1, `onnx-cuda-12`/`-13` chosen by driver, SHA256 + GPG verified. The CUDA build is a raw binary plus companion ONNX Runtime `.so` files, installed to `~/.local/lib/voxtype/` behind a wrapper. |
 | Ollama install | `curl \| sh` | Pinned 0.33.2 tarball, SHA256-verified, extracted to `/usr/local`, own systemd unit bound to `127.0.0.1`. |
 | Hotkey privilege | `input` group | Still the default for push-to-talk, but `HOTKEY_MODE=toggle ./install.sh` installs a variant that needs only a `uinput` group (no keyboard read access) and a COSMIC shortcut running `voxtype record toggle`. See INSTALL.md §1.2. |
 | Dictation log | plaintext, forever | Mode 600; `log_text`/`log_enabled` settings; `dictate log purge`. |
+| ydotool packages | `apt install ydotool` | Debian/Ubuntu ship the daemon separately as `ydotoold`; both are installed, with a pinned source build as fallback. |
 
 ## Layout
 
@@ -66,7 +67,7 @@ git init && git add -A && git commit -m "initial dictation stack"
 
 ## Daily use
 
-* Hold Right Ctrl, speak, release.
+* Hold the dictation key (F13), speak, release.
 * Teach a spelling: `dictate fix "kuber netties" "Kubernetes"` — takes effect on the next dictation.
 * Snippet: `dictate snippet "my address" "123 Main St…"` — speak the trigger alone.
 * Jargon for the LLM prompt: `dictate jargon "PipeWire" "COSMIC"`.

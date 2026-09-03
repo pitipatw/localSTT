@@ -92,13 +92,30 @@ def _read_json(path: Path, default):
         return default
 
 
+_EXAMPLE = re.compile(r"^Raw:\s*\"?(.*?)\"?\s*\n\s*Clean:\s*\"?(.*?)\"?\s*$", re.MULTILINE)
+
+
+def split_examples(prompt: str) -> tuple[str, list[tuple[str, str]]]:
+    """Pull 'Raw: … / Clean: …' pairs out of prompt.md.
+
+    They are sent as real user/assistant turns rather than as prose in the
+    system prompt: small models imitate demonstrations far more reliably than
+    they follow descriptions of them. Returns (system prompt without the
+    examples block, [(raw, clean), ...])."""
+    examples = [(r.strip(), c.strip()) for r, c in _EXAMPLE.findall(prompt)]
+    system = _EXAMPLE.sub("", prompt)
+    system = re.sub(r"\n\s*Examples?:\s*\n(\s*\n)*", "\n", system)
+    return system.strip(), examples
+
+
 @dataclass
 class Config:
     settings: dict
     corrections: dict
     snippets: dict
     jargon: list
-    prompt_template: str
+    prompt_template: str          # system prompt with the examples removed
+    examples: list                # [(raw, clean), ...] from prompt.md
 
     @classmethod
     def load(cls, directory: Path | None = None) -> "Config":
@@ -112,12 +129,14 @@ class Config:
                       if ln.strip() and not ln.startswith("#")]
         prompt_file = d / "prompt.md"
         template = prompt_file.read_text(encoding="utf-8") if prompt_file.exists() else FALLBACK_PROMPT
+        system, examples = split_examples(template)
         return cls(
             settings=settings,
             corrections=_read_json(d / "corrections.json", {}),
             snippets=_read_json(d / "snippets.json", {}),
             jargon=jargon,
-            prompt_template=template,
+            prompt_template=system,
+            examples=examples,
         )
 
 
@@ -194,18 +213,25 @@ class LLMError(Exception):
     pass
 
 
+def build_messages(system_prompt: str, text: str, previous: str, cfg: Config) -> list[dict]:
+    """system → few-shot demonstrations as real turns → the transcript to clean."""
+    messages = [{"role": "system", "content": system_prompt}]
+    for raw, clean in cfg.examples:
+        messages.append({"role": "user", "content": raw})
+        messages.append({"role": "assistant", "content": clean})
+    user = text if not previous else f"(previous dictation, for context only: {previous})\n\n{text}"
+    messages.append({"role": "user", "content": user})
+    return messages
+
+
 def call_llm(system_prompt: str, text: str, previous: str, cfg: Config) -> str:
     """One Ollama /api/chat round-trip. Raises LLMError on any failure."""
-    user = text if not previous else f"(previous dictation, for context only: {previous})\n\n{text}"
     body = json.dumps({
         "model": cfg.settings["model"],
-        "think": False,
+        "think": bool(cfg.settings.get("think", False)),
         "stream": False,
         "options": {"temperature": cfg.settings["temperature"]},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user},
-        ],
+        "messages": build_messages(system_prompt, text, previous, cfg),
     }).encode("utf-8")
     req = urllib.request.Request(cfg.settings["ollama_url"], data=body,
                                  headers={"Content-Type": "application/json"})

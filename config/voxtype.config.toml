@@ -5,7 +5,9 @@
 engine = "parakeet"
 
 [hotkey]
-key = "RIGHTCTRL"          # hold to record, release to transcribe + paste
+key = "F13"                # physical key remapped to F13 in the keyboard firmware (VIA/QMK). Must be a
+                           # NON-modifier: a bare Ctrl press/release leaves Electron apps (Claude, VS Code,
+                           # Slack) with stale modifier state and the paste chord is ignored there.
 modifiers = []
 mode = "push_to_talk"      # evdev listener; requires membership in the `input` group
 enabled = true
@@ -21,6 +23,8 @@ mode = "paste"                            # clipboard + keystroke; NOT "type" (y
 paste_keys = "shift+insert"               # works in GTK, Qt, Firefox, Electron/VS Code AND terminals
 restore_clipboard = true
 restore_clipboard_delay_ms = 300
+type_delay_ms = 60                        # ms between key events of the paste chord (ydotool -d). At ydotool's 12 ms default,
+                                          # Electron apps (Claude, VS Code, Slack…) receive the key without its modifier.
 fallback_to_clipboard = true
 driver_order = ["ydotool", "clipboard"]   # never wtype/eitype on COSMIC (types digits instead of text)
 
@@ -28,5 +32,5 @@ driver_order = ["ydotool", "clipboard"]   # never wtype/eitype on COSMIC (types 
 command = "/home/pitipatw/.local/bin/polish.py"   # symlink -> ~/dev/localTTS/polish.py
 timeout_ms = 6000                                 # polish.py itself gives up on Ollama after 4 s
 
-# Keep any recording overlay / OSD disabled on COSMIC — it can steal focus so the
-# paste lands in the wrong window. Use the tray/notification indicator instead.
+[osd]
+enabled = false                           # overlays can steal focus on COSMIC so the paste lands in the wrong window

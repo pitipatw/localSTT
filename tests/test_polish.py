@@ -210,3 +210,21 @@ def test_prompt_has_no_unfilled_slots(cfg):
     p = polish.build_prompt(cfg, "unknown")
     assert "{APP_CONTEXT}" not in p and "{JARGON_LIST}" not in p
     assert "Kubernetes" in p
+
+
+def test_examples_become_chat_turns(cfg):
+    assert len(cfg.examples) >= 8
+    assert cfg.examples[0] == ("send it monday actually delete that send it friday", "Send it Friday.")
+    assert "Raw:" not in cfg.prompt_template and "Clean:" not in cfg.prompt_template
+    msgs = polish.build_messages("SYS", "hello there friend how are you", "", cfg)
+    assert msgs[0] == {"role": "system", "content": "SYS"}
+    assert msgs[1]["role"] == "user" and msgs[2]["role"] == "assistant"
+    assert msgs[2]["content"] == "Send it Friday."
+    assert msgs[-1] == {"role": "user", "content": "hello there friend how are you"}
+    assert len(msgs) == 2 + 2 * len(cfg.examples)
+
+
+def test_split_examples_tolerates_quotes_and_missing_block():
+    sys_, ex = polish.split_examples('Rules.\n\nExamples:\nRaw: "a b"\nClean: "A b."\n')
+    assert sys_ == "Rules." and ex == [("a b", "A b.")]
+    assert polish.split_examples("Just rules.") == ("Just rules.", [])
