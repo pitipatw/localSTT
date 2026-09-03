@@ -40,7 +40,7 @@ Read **[INSTALL.md](INSTALL.md)** first — its §1 covers the security trade-of
 ```bash
 git clone git@github.com:pitipatw/localSTT.git ~/dev/localSTT
 cd ~/dev/localSTT
-chmod +x install.sh polish.py dictate tests/latency_report.py
+chmod +x install.sh polish.py dictate indicator.py tests/latency_report.py
 ./install.sh                     # toggle mode (default): press the shortcut to start, again to stop
 # push-to-talk instead (adds you to the `input` group — every user process can then read the keyboard):
 #   HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1 ./install.sh
@@ -54,6 +54,7 @@ Before the first dictation: in toggle mode (default), add a COSMIC custom shortc
 ## Daily use
 
 - Toggle mode (default): press your COSMIC shortcut, speak, press it again. Push-to-talk: hold F13, speak, release. Press Esc while holding to cancel without pasting.
+- **Green border around the screen = the mic is open.** Amber pulse = the 60 s hard cap is about to stop the recording on its own. No border = mic closed, or the indicator is down — if in doubt, `pw-top` (INSTALL.md Step 5a).
 - Turn it off / on: `systemctl --user stop voxtype` / `start`; `disable --now` keeps it off across logins, `enable --now` restores it. Nothing else is running in the foreground — the daemon is a systemd user service. Ollama is a separate system service (`sudo systemctl stop ollama`) that idles at zero CPU.
 - Spoken "new line" / "new paragraph" are flattened to spaces unless `"allow_newlines": true` is set (see Settings). Terminals never receive newlines, whatever the setting.
 - Misheard word: `dictate fix "what it heard" "What you meant"`. Spelling/capitalization the LLM should know: `dictate jargon "PipeWire"`. Snippet: `dictate snippet "my address" "123 Main St"`.
@@ -108,6 +109,7 @@ localSTT/
 ├── install.sh                   idempotent installer, one step per section, each verified
 ├── polish.py                    Voxtype post-process hook
 ├── dictate                      CLI: fix / unfix / snippet / jargon / list / test / log / app
+├── indicator.py                 → ~/.local/bin/dictate-indicator  screen-edge glow while the mic is open
 ├── config/
 │   ├── voxtype.config.toml      → ~/.config/voxtype/config.toml
 │   ├── voxtype.config.toggle.toml  toggle-mode variant (no `input` group)
@@ -116,9 +118,13 @@ localSTT/
 │   ├── snippets.json            → ~/.config/dictate/   spoken trigger → text
 │   ├── jargon.txt               → ~/.config/dictate/   one term per line
 │   └── settings.json            → ~/.config/dictate/   model, timeouts, guard thresholds, log privacy
-├── systemd/ydotool.service      user unit for the built ydotoold
+├── systemd/
+│   ├── ydotool.service          user unit for the built ydotoold
+│   └── dictate-indicator.service  user unit for the recording indicator (no network, AF_UNIX only)
+├── docs/feature-requests/       design notes for follow-ups (01 recording indicator: done; 02 hotkey daemon)
 └── tests/
-    ├── test_polish.py           22 unit tests, LLM mocked — `pytest -q tests/`
+    ├── test_polish.py           unit tests for the hook, LLM mocked — `pytest -q tests/`
+    ├── test_indicator.py        unit tests for the indicator's state logic, no GTK
     └── latency_report.py        `dictate log stats`
 ```
 
@@ -168,7 +174,8 @@ Control characters (ESC, BEL, NUL, …) are always stripped from the output befo
 
 ## Verification
 
-- Unit: `pytest -q tests/` — 37 tests, LLM mocked (U1–U10 from the handoff, edge cases, log privacy, and the S-series from `SECURITY_REVIEW.md`: output sanitization, loopback-only `ollama_url`, literal correction values).
+- Unit: `pytest -q tests/` — 55 tests, LLM mocked (U1–U10 from the handoff, edge cases, log privacy, the S-series from `SECURITY_REVIEW.md`: output sanitization, loopback-only `ollama_url`, literal correction values; and I1–I5 for the recording indicator: state file, PipeWire ground truth, hard-cap warning, source merging).
+- Indicator: `dictate-indicator --check` (graphics stack), `dictate-indicator --demo 8` while pasting into a GTK app, an Electron app and Alacritty (paste-through), and `pw-top` next to the glow (visible exactly while a `voxtype` capture stream exists).
 - Integration (handoff §7.2): passed 2026-09-02 — paste in four apps, clipboard image restored, silent release pastes nothing, 30 s dictation intact.
 - Latency (§7.3): after ~20 dictations, `dictate log stats`. Early numbers: Parakeet 0.13–0.21 s, LLM path 55–700 ms. If over budget: `qwen3:4b` in `settings.json`, shorter `prompt.md`.
 - Accuracy (§7.4) and safety (§7.5): as in the handoff; re-run `dictate test` cases after prompt or dictionary changes.
@@ -178,3 +185,4 @@ Control characters (ESC, BEL, NUL, …) are always stripped from the output befo
 1. GPU inference: optional. Needs CUDA 13 runtime + cuDNN 9 on the system, then `VOXTYPE_VARIANT=auto ./install.sh voxtype`.
 2. App-context helper (C9): something that writes the focused `app_id` to `~/.config/dictate/app_id`; the read side exists.
 3. Hands-free toggle (C2), Command Mode (C12), learning from edits (C13/C16), wake word (C17): not started — see the handoff §4.
+4. Recording indicator (docs/feature-requests/01): implemented as `dictate-indicator` (edge glow, state file + PipeWire, amber pulse before the hard cap). Verified under headless sway (two outputs); still to confirm on COSMIC itself: the paste-through test in Electron apps — see INSTALL.md Step 5a.
