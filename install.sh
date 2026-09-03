@@ -2,20 +2,22 @@
 # Idempotent installer for the local dictation stack on Pop!_OS COSMIC (Wayland).
 # Re-run freely; every step checks before it acts and ends with a verification.
 #
-#   ./install.sh                      run all steps (push-to-talk, needs `input` group)
-#   HOTKEY_MODE=toggle ./install.sh   toggle mode: no `input` group, hotkey via COSMIC shortcut
-#   ./install.sh --list               show step names
-#   ./install.sh <step>...            run only the named steps (e.g. ./install.sh voxtype model)
+#   ./install.sh                            run all steps (toggle mode: hotkey via COSMIC shortcut)
+#   HOTKEY_MODE=push_to_talk ./install.sh   hold-to-talk via the sandboxed hotkeyd daemon
+#   ./install.sh --list                     show step names
+#   ./install.sh <step>...                  run only the named steps (e.g. ./install.sh voxtype model)
 #
 # Security posture (see INSTALL.md and SECURITY_REVIEW.md):
 #   * Nothing is piped from the network into a shell. Every download is pinned to
 #     a version AND to a digest recorded in this file; a mismatch stops the run.
 #     Voxtype's SHA256SUMS.txt must carry a valid signature from VOXTYPE_GPG_KEY
 #     (REQUIRE_GPG=0 to accept sha256-only, not recommended).
-#   * Default hotkey mode is toggle (no `input` group). push_to_talk must be
-#     confirmed with I_ACCEPT_INPUT_GROUP=1 because it exposes every keystroke.
-#   * The only privileged actions are apt installs, the udev rule, group membership,
-#     and installing Ollama under /usr/local with its own sandboxed system user.
+#   * Your user is never added to the `input` group. Hold-to-talk reads the keyboard
+#     from a dedicated system user (`hotkeyd`, 80 lines, sandboxed) that only reports
+#     F13 press/release on a socket; your session just needs `uinput` for pasting.
+#   * The only privileged actions are apt installs, the udev rule, the `uinput` group,
+#     the hotkeyd user + system unit, and installing Ollama under /usr/local with
+#     its own sandboxed system user.
 
 set -euo pipefail
 trap 'printf "  \033[31m✘\033[0m unexpected failure at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
@@ -59,8 +61,12 @@ VOX_LIB="$HOME/.local/lib/voxtype"
 DICTATE_DIR="$HOME/.config/dictate"
 MODE_STAMP="$DICTATE_DIR/hotkey_mode"           # remembers the mode chosen on a previous run
 # Mode precedence: explicit HOTKEY_MODE > what a previous run installed > toggle.
-# Toggle is the default because push_to_talk needs the `input` group (see INSTALL.md §1).
+# Neither mode touches the `input` group: push_to_talk installs the hotkeyd system service instead.
 HOTKEY_MODE="${HOTKEY_MODE:-$(cat "$MODE_STAMP" 2>/dev/null || echo toggle)}"     # push_to_talk | toggle
+UINPUT_GROUP=uinput                             # the one group your user needs (paste via ydotool)
+HOTKEYD_LIB=/usr/local/lib/hotkeyd              # root-owned copy of hotkeyd.py: the daemon cannot edit itself
+HOTKEYD_UNIT=/etc/systemd/system/hotkeyd.service
+RELAY_UNIT="$HOME/.config/systemd/user/hotkey-relay.service"
 ME="$(id -un)"                                  # not $USER: that is just an environment variable
 VOX_CFG_DIR="$HOME/.config/voxtype"
 MODEL_DIR="$HOME/.local/share/voxtype/models/parakeet-tdt-0.6b-v3"
@@ -81,22 +87,12 @@ fetch() { # fetch <url> <dest>  (skips if dest exists and is non-empty; https on
 }
 
 case "$HOTKEY_MODE" in
-  push_to_talk)
-    UINPUT_GROUP=input
-    if [[ ${I_ACCEPT_INPUT_GROUP:-0} != 1 ]]; then
-      cat >&2 <<'MSG'
-push_to_talk adds you to the 'input' group. After that, EVERY program running as you can read
-every keystroke from /dev/input (passwords included) and inject keystrokes — not just Voxtype.
-See INSTALL.md §1. To accept that trade-off, re-run with:
-    HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1 ./install.sh
-or use the default:
-    HOTKEY_MODE=toggle ./install.sh
-MSG
-      exit 1
-    fi ;;
-  toggle)       UINPUT_GROUP=uinput ;;
+  push_to_talk|toggle) ;;
   *) fail "HOTKEY_MODE must be push_to_talk or toggle" ;;
 esac
+if [[ -n ${I_ACCEPT_INPUT_GROUP:-} ]]; then
+  warn "I_ACCEPT_INPUT_GROUP is obsolete: hold-to-talk no longer needs your user in the 'input' group (see INSTALL.md §1.2)"
+fi
 
 build_ydotool() {
   # Source build of ReimuNotMoe/ydotool at a pinned tag. Installs ydotool + ydotoold
@@ -157,7 +153,7 @@ step_apt() {
 
 step_ydotool() {
   step "ydotool / uinput  (group: $UINPUT_GROUP)"
-  if [[ $UINPUT_GROUP == uinput ]] && ! getent group uinput >/dev/null; then
+  if ! getent group uinput >/dev/null; then
     sudo groupadd --system uinput; ok "created group uinput"
   fi
   if id -nG "$ME" | grep -qw "$UINPUT_GROUP"; then
@@ -166,8 +162,8 @@ step_ydotool() {
     sudo usermod -aG "$UINPUT_GROUP" "$ME"; NEED_RELOGIN=1
     warn "added $ME to group $UINPUT_GROUP — takes effect after logout/login"
   fi
-  if [[ $UINPUT_GROUP == uinput ]] && id -nG "$ME" | grep -qw input; then
-    warn "$ME is ALSO in group 'input' (keyboard read access). Toggle mode does not need it: sudo gpasswd -d $ME input"
+  if id -nG "$ME" | grep -qw input; then
+    warn "$ME is in group 'input' (every process running as you can read the keyboard). localSTT no longer needs it in any mode: sudo gpasswd -d $ME input"
   fi
 
   local rule=/etc/udev/rules.d/80-uinput.rules
@@ -518,8 +514,9 @@ step_config() {
   for f in prompt.md corrections.json snippets.json jargon.txt settings.json; do
     if [[ -e "$DICTATE_DIR/$f" ]]; then ok "$f exists (kept)"; else cp "$REPO/config/$f" "$DICTATE_DIR/$f"; ok "$f installed"; fi
   done
+  # One template for both modes: Voxtype's own evdev listener stays off; the hotkey (COSMIC
+  # shortcut or hotkeyd) drives it through `voxtype record ...`.
   local src="$REPO/config/voxtype.config.toml"
-  [[ $HOTKEY_MODE == toggle ]] && src="$REPO/config/voxtype.config.toggle.toml"
   local cfg="$VOX_CFG_DIR/config.toml"
   local rendered; rendered=$(<"$src"); rendered=${rendered//\/home\/pitipatw/"$HOME"}   # quoted: bash 5.2 would expand & in an unquoted replacement
   if [[ -e $cfg ]] && ! cmp -s <(printf '%s\n' "$rendered") "$cfg"; then
@@ -530,6 +527,76 @@ step_config() {
   ok "wrote $cfg"
   printf 'um so uh this is a test of the polish hook with enough words' | "$BIN/polish.py" >/dev/null && ok "polish.py runs end to end (see: dictate log tail 1)"
   [[ -f "$LOG_DIR/log.jsonl" ]] && { chmod 600 "$LOG_DIR/log.jsonl"; ok "log.jsonl is mode 600"; }
+}
+
+render_unit() {
+  # render_unit <template>: prints it with @USER@/@BIN@ filled in. Bash substitution, not sed:
+  # the values are data and must never be interpreted as a pattern.
+  local t; t=$(<"$1"); t=${t//@USER@/"$ME"}; t=${t//@BIN@/"$BIN"}; printf '%s\n' "$t"
+}
+
+step_hotkeyd() {
+  # Hold-to-talk without putting $ME in `input` (docs/feature-requests/02-hotkey-daemon.md):
+  #   /dev/input -> hotkeyd (system user, sandboxed) -> /run/hotkeyd/hotkey.sock -> hotkey-relay (you) -> voxtype record start|stop
+  step "hotkeyd  (hold-to-talk without the input group; mode: $HOTKEY_MODE)"
+  if [[ $HOTKEY_MODE != push_to_talk ]]; then
+    # Toggle mode: make sure nothing is left reading the keyboard from a previous push_to_talk install.
+    [[ -f $HOTKEYD_UNIT ]] && { sudo systemctl disable --now hotkeyd >/dev/null 2>&1 || true; ok "hotkeyd disabled"; }
+    [[ -f $RELAY_UNIT ]] && { systemctl --user disable --now hotkey-relay >/dev/null 2>&1 || true; ok "hotkey-relay disabled"; }
+    ok "toggle mode: no keyboard reader installed"
+    return 0
+  fi
+  local src="$REPO/hotkeyd/hotkeyd.py" lines
+  lines=$(wc -l < "$src")
+  (( lines <= 80 )) || fail "hotkeyd.py is $lines lines; the audit budget is 80 — do not grow it (see the feature request)"
+  if ! id hotkeyd >/dev/null 2>&1; then
+    sudo useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin hotkeyd
+    ok "created system user hotkeyd (group input is granted by the unit, not by membership)"
+  fi
+  # Root-owned copy: neither the daemon nor anything else running as hotkeyd can rewrite its own code.
+  if sudo cmp -s "$src" "$HOTKEYD_LIB/hotkeyd.py"; then
+    ok "$HOTKEYD_LIB/hotkeyd.py up to date ($lines lines)"
+  else
+    sudo install -D -o root -g root -m 0755 "$src" "$HOTKEYD_LIB/hotkeyd.py"
+    ok "installed $HOTKEYD_LIB/hotkeyd.py ($lines lines, root-owned)"
+  fi
+  local rendered; rendered=$(render_unit "$REPO/systemd/hotkeyd.service")
+  if [[ -f $HOTKEYD_UNIT ]] && cmp -s <(printf '%s\n' "$rendered") "$HOTKEYD_UNIT"; then
+    ok "system unit up to date"
+  else
+    printf '%s\n' "$rendered" | sudo tee "$HOTKEYD_UNIT" >/dev/null
+    sudo systemctl daemon-reload
+    ok "wrote $HOTKEYD_UNIT"
+  fi
+  sudo systemctl enable hotkeyd >/dev/null 2>&1
+  sudo systemctl restart hotkeyd
+  sleep 1
+  if ! systemctl is-active hotkeyd >/dev/null 2>&1; then
+    sudo journalctl -u hotkeyd -n 10 --no-pager | sed 's/^/  /'
+    fail "hotkeyd is not running (log above)"
+  fi
+  local sock=/run/hotkeyd/hotkey.sock perms
+  [[ -S $sock ]] || fail "$sock was not created — sudo journalctl -u hotkeyd -n 20"
+  perms=$(stat -c '%a %U %G' "$sock")
+  [[ $perms == "660 hotkeyd $ME" ]] || fail "$sock is '$perms', expected '660 hotkeyd $ME' — other users could see when you dictate; check the unit's ExecStartPre"
+  ok "hotkeyd running; socket $sock (660 hotkeyd:$ME)"
+  command -v systemd-analyze >/dev/null && echo "  sandbox: $(systemd-analyze security hotkeyd 2>/dev/null | tail -1 | sed 's/^→ //')"
+
+  # The relay runs as you, outside `input`, and is the only thing that turns start/stop into a recording.
+  install -m 0755 "$REPO/hotkeyd/hotkey-relay" "$BIN/hotkey-relay"
+  mkdir -p "$(dirname "$RELAY_UNIT")"
+  render_unit "$REPO/systemd/hotkey-relay.service" > "$RELAY_UNIT"
+  systemctl --user daemon-reload
+  systemctl --user enable hotkey-relay >/dev/null 2>&1 || true
+  systemctl --user restart hotkey-relay
+  sleep 1
+  if systemctl --user is-active hotkey-relay >/dev/null 2>&1; then
+    ok "hotkey-relay running as $ME → $BIN/voxtype record start|stop"
+  else
+    journalctl --user -u hotkey-relay -n 6 --no-pager | sed 's/^/  /'
+    fail "hotkey-relay is not running (log above)"
+  fi
+  id -nG "$ME" | grep -qw input && warn "$ME is still in group 'input'; hold-to-talk no longer needs it: sudo gpasswd -d $ME input" || true
 }
 
 step_service() {
@@ -567,13 +634,14 @@ step_summary() {
   5. Mic-in-use check: run  pw-top  and confirm a voxtype capture stream exists ONLY while recording
   6. After ~20 dictations: dictate log stats
   Logs: journalctl --user -u voxtype -f   |   dictate log tail   |   dictate log purge
+$( [[ $HOTKEY_MODE == push_to_talk ]] && echo "  Hold-to-talk: sudo journalctl -u hotkeyd -f   |   journalctl --user -u hotkey-relay -f   (your user is NOT in 'input')" )
   Text logging is OFF by default ("log_text": true in ~/.config/dictate/settings.json turns it on).
   Newlines are OFF by default ("allow_newlines": true keeps "new line"/"new paragraph"; never in terminals).
   Mode '$HOTKEY_MODE' is remembered in $MODE_STAMP; pass HOTKEY_MODE=... to change it.
 EOF
 }
 
-ALL=(preflight apt ydotool ollama voxtype model config service summary)
+ALL=(preflight apt ydotool ollama voxtype model config hotkeyd service summary)
 if [[ "${1:-}" == "--list" ]]; then printf '%s\n' "${ALL[@]}"; exit 0; fi
 if (($#)); then STEPS=("$@" summary); else STEPS=("${ALL[@]}"); fi
 for s in "${STEPS[@]}"; do

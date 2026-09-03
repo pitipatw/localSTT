@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""hotkey-relay: runs as YOU (not in `input`), reads "start"/"stop" lines from hotkeyd's socket and
+drives Voxtype with `voxtype record start|stop`. Anything else on the socket is dropped. When the
+socket goes away the relay exits non-zero and systemd restarts it; while it is down, holding F13
+does nothing, so the microphone never turns on without this process in the loop.
+"""
+import os
+import socket
+import subprocess
+import sys
+
+SOCK = os.environ.get("HOTKEYD_SOCKET", "/run/hotkeyd/hotkey.sock")
+VOXTYPE = os.environ.get("VOXTYPE_BIN", "voxtype")
+COMMANDS = {"start", "stop"}             # the only two things hotkeyd may make us do
+VOXTYPE_TIMEOUT_S = 2
+
+
+def command_for(line):
+    """The voxtype sub-command a socket line maps to, or None if the line is not exactly allowed."""
+    text = line.decode("ascii", "replace").strip()
+    return text if text in COMMANDS else None
+
+
+def main():
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.connect(SOCK)
+        for line in sock.makefile("rb"):
+            cmd = command_for(line)
+            if cmd is None:
+                continue
+            try:
+                subprocess.run([VOXTYPE, "record", cmd], stdin=subprocess.DEVNULL, timeout=VOXTYPE_TIMEOUT_S)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                print(f"hotkey-relay: voxtype record {cmd}: {e}", file=sys.stderr)
+    sys.exit("hotkey-relay: hotkeyd closed the socket; exiting so systemd restarts us")
+
+
+if __name__ == "__main__":
+    main()

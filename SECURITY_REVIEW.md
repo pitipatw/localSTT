@@ -6,7 +6,7 @@ Applied in the working tree (see the commit sequence in the README's install sec
 | Finding | Status | Where |
 |---|---|---|
 | H1 Parakeet unverified | **Fixed** — pinned to commit `8f23f0c0`; sha256 for the three LFS files, git blob ids for `vocab.txt`/`config.json`; mismatching files are deleted | `install.sh` `step_model`, `PARAKEET_*` |
-| H2 `input` group default | **Fixed** — toggle is the default; push-to-talk requires `I_ACCEPT_INPUT_GROUP=1`; chosen mode remembered in `~/.config/dictate/hotkey_mode` | `install.sh` mode block, `step_config` |
+| H2 `input` group default | **Fixed, then removed entirely** — toggle is the default; push-to-talk now runs the sandboxed `hotkeyd` system service (feature request 02) so the user is never in `input`; `I_ACCEPT_INPUT_GROUP` is gone; chosen mode remembered in `~/.config/dictate/hotkey_mode` | `install.sh` `step_hotkeyd`, `hotkeyd/`, `systemd/hotkeyd.service`, `tests/test_hotkeyd.py` |
 | H3 fail-open verification | **Fixed** — `REQUIRE_GPG=1` default; ydotool commit pinned; model weights blob digest checked after pull; `OLLAMA_SHA256` slot added (**still empty — pin it**: `sha256sum ~/.cache/localstt-downloads/ollama-0.33.2.tar.zst`; the installer nags until you do) | `install.sh` pins, `step_ollama`, `build_ydotool` |
 | M1 output sanitization | **Fixed** — `sanitize_output()` on every path incl. crash fallback; `allow_newlines` setting (default off, never for terminals); 3 tests | `polish.py`, `tests/test_polish.py` S1 |
 | M2 `ollama_url` exfil | **Fixed** — loopback + plain-http only, no redirects; 3 tests | `polish.py` `validate_ollama_url`, S2 |
@@ -20,4 +20,5 @@ Not yet done / needs you:
 - Pin `OLLAMA_SHA256` (one line) after reading the hash off the cached tarball.
 - Double-check the Voxtype fingerprint `9CCF…9279` against the Voxtype release notes: it is *not* among the keys on the author's GitHub profile (checked 2026-09-03), so the release notes are the only source for it.
 - Re-run `./install.sh` on pop-os; the ydotool and Ollama steps rewrite their units. Expect the Ollama step to print a `systemd-analyze security` score.
-- Follow-ups filed as feature requests: `docs/feature-requests/01-recording-indicator.md`, `docs/feature-requests/02-hotkey-daemon.md`.
+- Run `HOTKEY_MODE=push_to_talk ./install.sh` once and confirm `systemd-analyze security hotkeyd` scores under 3 and `id -nG` no longer lists `input`.
+- Follow-ups filed as feature requests: `docs/feature-requests/01-recording-indicator.md` (open), `docs/feature-requests/02-hotkey-daemon.md` (implemented).

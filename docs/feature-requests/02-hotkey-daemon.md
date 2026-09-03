@@ -1,5 +1,7 @@
 # Feature request: hold-to-talk WITHOUT putting the user in the `input` group
 
+**Status: implemented** — `hotkeyd/hotkeyd.py`, `hotkeyd/hotkey-relay`, `systemd/hotkeyd.service`, `systemd/hotkey-relay.service`, `install.sh` `step_hotkeyd`, `tests/test_hotkeyd.py`; documented in INSTALL.md §1.2. Deviation from the sketch below: the socket directory is made setgid-`<user>` by a root `ExecStartPre` so the socket inherits the group without adding you to a `hotkeyd` group (no re-login).
+
 **Why.** Push-to-talk currently requires the user's account to be in `input`, which lets every
 process running as that user read every keystroke (SECURITY_REVIEW.md H2, INSTALL.md §1.2). That is
 why toggle mode is now the default. This proposal restores the hold-to-talk feel while keeping the

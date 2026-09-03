@@ -1,0 +1,16 @@
+# managed by localSTT v1 — install.sh fills in ~/.local/bin and writes this to ~/.config/systemd/user/
+# Runs as you, outside the `input` group. Bridges hotkeyd's socket to `voxtype record start|stop`.
+[Unit]
+Description=localSTT hotkey relay (hotkeyd socket -> voxtype record start/stop)
+After=voxtype.service
+ConditionPathExists=/run/hotkeyd
+
+[Service]
+ExecStart=/usr/bin/python3 -u @BIN@/hotkey-relay
+Environment=VOXTYPE_BIN=@BIN@/voxtype
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
