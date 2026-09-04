@@ -83,7 +83,7 @@ Run in a terminal, in order. `install.sh` is idempotent: re-running it skips wha
 
 ```bash
 cd ~/dev/localSTT
-chmod +x install.sh polish.py dictate tests/latency_report.py
+chmod +x install.sh polish.py dictate indicator.py tests/latency_report.py
 git init && git add -A && git commit -m "initial dictation stack"
 ```
 
@@ -95,7 +95,7 @@ git init && git add -A && git commit -m "initial dictation stack"
 HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1 ./install.sh     # push-to-talk (adds you to `input`; see §1.2)
 ```
 
-It asks for your sudo password for: apt installs, the `/dev/uinput` udev rule, the group change, extracting Ollama to `/usr/local`, and creating the `ollama` user and system service. Everything else is under your home directory. Each `==` section ends with green ✔ lines; a yellow `!` is informational; a red ✘ stops the run and says why.
+It asks for your sudo password for: apt installs, the `/dev/uinput` udev rule, the group change, extracting Ollama to `/usr/local`, and creating the `ollama` user and system service. Everything else is under your home directory. `INDICATOR=0 ./install.sh` skips the recording indicator (Step 5a) — not recommended in toggle mode. Each `==` section ends with green ✔ lines; a yellow `!` is informational; a red ✘ stops the run and says why.
 
 The slow parts are the Parakeet download (~2.5 GB) and `ollama pull qwen3:8b` (~5 GB). Downloads are cached in `~/.cache/localstt-downloads` so a re-run does not fetch them again.
 
@@ -141,15 +141,38 @@ EOF
 
 *Test the binding:* open a text editor, press the shortcut, say "testing one two three", press it again. If nothing happens, run `/home/<you>/.local/bin/voxtype record toggle` twice from a terminal — if that records and pastes, the problem is the shortcut; if it does not, look at `journalctl --user -u voxtype -f`.
 
+**Step 5a — the recording indicator (on by default)**
+
+Toggle mode's one failure mode is forgetting the second press: the mic stays open and whatever the room says is pasted when you finally stop it. The `indicator` step installs `dictate-indicator`, a user service that paints a **green border around every monitor while the microphone is open** and draws nothing otherwise. It turns amber and pulses for the last 10 s before Voxtype's own hard cap (`[audio] max_duration_secs = 60` in the config — raise it for long dictation; the indicator reads the value) stops the recording and pastes what it has.
+
+How it knows: it reads Voxtype's state file (`$XDG_RUNTIME_DIR/voxtype/state`, `state_file = "auto"` in the config) *and* asks PipeWire every 500 ms whether a running `voxtype` capture stream exists. Either one lights the border, so an indicator driven by the real audio graph cannot claim the mic is closed while it is open. It shows state only — it never sees the transcript.
+
+Fail-visible rule: **no glow means the mic is closed — or the indicator is down.** If you think you are recording and see no border, treat that as "check the mic": `pw-top` (a `voxtype` capture row = still recording; press your shortcut) and `systemctl --user status dictate-indicator`. The unit restarts itself on any crash.
+
+Why it cannot steal the paste: the overlay is a Wayland layer-shell surface on the overlay layer with keyboard interactivity *none*, an empty input region and exclusive zone −1, so the compositor never gives it focus, keys or pointer events and it reserves no screen space. Verify once per app you care about:
+
+```bash
+dictate-indicator --demo 8 &          # glow for 8 s regardless of state
+echo "paste-through test" | wl-copy; sleep 2; ydotool key -d 60 42:1 110:1 110:0 42:0   # shift+insert into a focused editor
+```
+
+Text must appear while the border is up. Tested targets: a GTK app (COSMIC Text Editor), an Electron app (Claude/VS Code) and Alacritty. `dictate-indicator --check` verifies the graphics stack (GTK 4 + gtk4-layer-shell + a layer-shell-capable compositor) and is what the installer runs.
+
+Dependencies (apt): `python3-gi python3-gi-cairo gir1.2-gtk-4.0`. gtk4-layer-shell has no package on Ubuntu/Pop!_OS 24.04, so the installer builds v1.1.1 from a pinned commit into `~/.local/lib` (build tools via apt: meson, ninja, libgtk-4-dev, …); on releases that package `gir1.2-gtk4layershell-1.0` it uses that instead. `dictate-indicator` searches `~/.local/lib` itself when neither the distro package nor `GTK4_LAYER_SHELL_LIB` is present, so the commands above work in a plain terminal; the user unit also carries explicit `Environment=` lines for the same paths. Nothing in `polish.py` changes — the indicator is a separate process with no network (`RestrictAddressFamilies=AF_UNIX`), not in the `input` group, running as you.
+
+`INDICATOR=0 ./install.sh indicator` disables the unit again.
+
 **Step 6 — paste path probe (no microphone yet)**
 
 ```bash
 echo "hello from ydotool" | wl-copy
 # click into COSMIC Text Editor, then within 3 s:
-sleep 3 && ydotool key shift+insert
+sleep 3 && ydotool key -d 60 42:1 110:1 110:0 42:0    # shift+insert; see the note below
 ```
 
 Text must appear. If not: `systemctl --user status ydotool`, `ls -l /dev/uinput` (group should match your mode, mode 660), `echo $YDOTOOL_SOCKET`.
+
+The numeric arguments are not decoration. ydotool 1.x takes `keycode:state` pairs (42 = `KEY_LEFTSHIFT`, 110 = `KEY_INSERT`), and it **exits 0 without injecting anything** when handed a 0.x-style name like `shift+insert` — so the older form looks like a silent install failure rather than a bad command. `-d 60` matches `type_delay_ms` so the probe behaves like the real paste path in Electron apps (see §Troubleshooting). Voxtype itself parses `paste_keys = "shift+insert"` and calls ydotool with these same codes.
 
 **Step 7 — LLM probe (no microphone yet)**
 
@@ -175,7 +198,7 @@ Repeat step 8 in Firefox/Edge, VS Code, and the Claude app (all accept `shift+in
 
 **Step 11 — microphone-in-use check**
 
-Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture stream; while recording, one should appear; when you release, it should go away. Expect two rows while recording: the microphone *device* (e.g. a webcam's audio node, woken up because something is reading from it) and the `voxtype` *stream* consuming it — that pairing is normal. A `voxtype` row that persists while idle, or the device staying active with no stream under it, would be worth investigating. If a stream stays open permanently, that is worth knowing (and worth reporting upstream); it does not mean audio is being sent anywhere, but it is the behaviour §1.1 assumes.
+Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture stream; while recording, one should appear; when you release, it should go away. The screen-edge glow (Step 5a) must be visible exactly while that stream exists — on every monitor — and nothing must be drawn once it is gone. Expect two rows while recording: the microphone *device* (e.g. a webcam's audio node, woken up because something is reading from it) and the `voxtype` *stream* consuming it — that pairing is normal. A `voxtype` row that persists while idle, or the device staying active with no stream under it, would be worth investigating. If a stream stays open permanently, that is worth knowing (and worth reporting upstream); it does not mean audio is being sent anywhere, but it is the behaviour §1.1 assumes.
 
 **Step 12 — tune over the first week**
 
@@ -195,6 +218,7 @@ Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture str
 | group membership `input` or `uinput` | evdev / uinput access | `sudo gpasswd -d $USER input` (or `uinput`) |
 | `/usr/local/bin/ollama`, `/usr/local/lib/ollama/`, `/etc/systemd/system/ollama.service`, user `ollama`, `/usr/share/ollama/` (models) | Ollama | `sudo systemctl disable --now ollama; sudo rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /etc/systemd/system/ollama.service; sudo userdel -r ollama` |
 | `~/.local/lib/voxtype/`, `~/.local/bin/voxtype` (wrapper), `~/.local/bin/polish.py`, `~/.local/bin/dictate` | Voxtype + hooks | `rm -rf` those paths |
+| `~/.local/bin/dictate-indicator`, `~/.config/systemd/user/dictate-indicator.service`, `~/.local/lib/libgtk4-layer-shell*`, `~/.local/lib/girepository-1.0/Gtk4LayerShell-1.0.typelib`, `~/.local/include/gtk4-layer-shell/`, `~/.local/lib/pkgconfig/gtk4-layer-shell-0.pc`, `~/.local/share/gir-1.0/Gtk4LayerShell-1.0.gir` | recording indicator | `systemctl --user disable --now dictate-indicator`, then delete |
 | `~/.local/share/voxtype/models/` | Parakeet | `rm -rf` |
 | `~/.config/voxtype/config.toml`, `~/.config/dictate/`, `~/.config/systemd/user/{ydotool,voxtype}.service*`, `~/.config/environment.d/ydotool.conf`, `~/.profile` (one `export YDOTOOL_SOCKET` line) | config | `systemctl --user disable --now voxtype ydotool`, then delete |
 | `~/.local/share/dictate/log.jsonl` | dictation log | `dictate log purge` |

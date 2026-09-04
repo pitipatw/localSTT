@@ -1,5 +1,17 @@
 # Feature request: make it obvious when the mic is live (toggle mode)
 
+**Status (2026-09-03): implemented** as `indicator.py` → `~/.local/bin/dictate-indicator` (installer step
+`indicator`, on by default, `INDICATOR=0` opts out). Choices made against the options below: **A** (edge
+glow via gtk4-layer-shell, one surface per monitor) driven by **1 + 3 combined** — Voxtype 1.0.1 has no
+record hooks but writes a state file (`state_file = "auto"` → `$XDG_RUNTIME_DIR/voxtype/state`,
+values `idle | recording | streaming | transcribing`, which `voxtype record toggle` itself depends on), and
+PipeWire (`pw-dump`, 500 ms) is polled as ground truth; either source lights the glow. **F** is Voxtype's
+own `[audio] max_duration_secs` (60 s, now explicit in the config); the glow pulses amber for the last
+10 s. Definition-of-done items that need the COSMIC desktop (paste-through under the overlay, multi-monitor,
+`pw-top` agreement) are the manual checks in INSTALL.md Step 5a; the state logic is unit-tested (tests I1–I5), and the
+overlay itself was exercised under a headless wlroots compositor (sway, two outputs): border on both outputs, transparent
+interior, amber pulse, and the layer surfaces destroyed — not just hidden — when idle.
+
 **Why.** Toggle mode is now the default (`install.sh`, SECURITY_REVIEW.md H2). Its one failure mode is
 forgetting to press the shortcut a second time: the mic stays open, and everything the room says is
 transcribed and pasted when it is finally stopped. The output sanitizer makes that harmless in a
