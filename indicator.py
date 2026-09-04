@@ -173,25 +173,56 @@ class PipeWireWatcher:
 
 
 # ---- GTK / layer-shell overlay ----------------------------------------------
-def _load_layer_shell_library() -> None:
-    """gtk4-layer-shell must be loaded before GTK touches libwayland-client (see its README).
-    GTK4_LAYER_SHELL_LIB points at a source build under ~/.local; otherwise use the system copy."""
-    from ctypes import CDLL
+USER_LIB = os.path.expanduser("~/.local/lib")            # where install.sh puts a source build
+USER_TYPELIB = os.path.join(USER_LIB, "girepository-1.0")
+
+
+def layer_shell_candidates() -> list:
+    """Shared objects to try, most specific first: an explicit override, the distro package,
+    install.sh's source build under ~/.local, then the bare loader names. The ~/.local entries
+    matter because Ubuntu/Pop!_OS 24.04 ship no gtk4-layer-shell package, so install.sh builds
+    one there — and ~/.local/lib is not on the default loader path."""
     from ctypes.util import find_library
-    candidates = [os.environ.get("GTK4_LAYER_SHELL_LIB"), find_library("gtk4-layer-shell"),
-                  "libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"]
+    return [c for c in (os.environ.get("GTK4_LAYER_SHELL_LIB"),
+                        find_library("gtk4-layer-shell"),
+                        os.path.join(USER_LIB, "libgtk4-layer-shell.so.0"),
+                        os.path.join(USER_LIB, "libgtk4-layer-shell.so"),
+                        "libgtk4-layer-shell.so.0",
+                        "libgtk4-layer-shell.so") if c]
+
+
+def _add_user_typelib_path() -> None:
+    """girepository reads GI_TYPELIB_PATH once, when gi is first imported, and does not search
+    ~/.local. Append rather than prepend so an explicit GI_TYPELIB_PATH still wins."""
+    if not os.path.isdir(USER_TYPELIB):
+        return
+    current = os.environ.get("GI_TYPELIB_PATH", "")
+    if USER_TYPELIB in current.split(os.pathsep):
+        return
+    os.environ["GI_TYPELIB_PATH"] = os.pathsep.join(p for p in (current, USER_TYPELIB) if p)
+
+
+def _load_layer_shell_library() -> str:
+    """gtk4-layer-shell must be loaded before GTK touches libwayland-client (see its README).
+    Returns the candidate that loaded, so the caller can keep the typelib search consistent
+    with the shared object it actually got."""
+    from ctypes import CDLL
     errors = []
-    for c in filter(None, candidates):
+    for c in layer_shell_candidates():
         try:
             CDLL(c)
-            return
+            return c
         except OSError as e:
             errors.append(f"{c}: {e}")
     raise RuntimeError("libgtk4-layer-shell not found — run ./install.sh indicator\n  " + "\n  ".join(errors))
 
 
 def _import_gtk():
-    _load_layer_shell_library()
+    loaded = _load_layer_shell_library()
+    # Only reach for the ~/.local typelib when the library itself came from there: pairing a
+    # distro .so with a source-built typelib (or the reverse) is a version mismatch.
+    if loaded.startswith(USER_LIB + os.sep):
+        _add_user_typelib_path()
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gdk", "4.0")

@@ -153,12 +153,12 @@ Why it cannot steal the paste: the overlay is a Wayland layer-shell surface on t
 
 ```bash
 dictate-indicator --demo 8 &          # glow for 8 s regardless of state
-echo "paste-through test" | wl-copy; sleep 2; ydotool key shift+insert   # into a focused editor
+echo "paste-through test" | wl-copy; sleep 2; ydotool key -d 60 42:1 110:1 110:0 42:0   # shift+insert into a focused editor
 ```
 
 Text must appear while the border is up. Tested targets: a GTK app (COSMIC Text Editor), an Electron app (Claude/VS Code) and Alacritty. `dictate-indicator --check` verifies the graphics stack (GTK 4 + gtk4-layer-shell + a layer-shell-capable compositor) and is what the installer runs.
 
-Dependencies (apt): `python3-gi python3-gi-cairo gir1.2-gtk-4.0`. gtk4-layer-shell has no package on Ubuntu/Pop!_OS 24.04, so the installer builds v1.1.1 from a pinned commit into `~/.local/lib` (build tools via apt: meson, ninja, libgtk-4-dev, …); on releases that package `gir1.2-gtk4layershell-1.0` it uses that instead. Nothing in `polish.py` changes — the indicator is a separate process with no network (`RestrictAddressFamilies=AF_UNIX`), not in the `input` group, running as you.
+Dependencies (apt): `python3-gi python3-gi-cairo gir1.2-gtk-4.0`. gtk4-layer-shell has no package on Ubuntu/Pop!_OS 24.04, so the installer builds v1.1.1 from a pinned commit into `~/.local/lib` (build tools via apt: meson, ninja, libgtk-4-dev, …); on releases that package `gir1.2-gtk4layershell-1.0` it uses that instead. `dictate-indicator` searches `~/.local/lib` itself when neither the distro package nor `GTK4_LAYER_SHELL_LIB` is present, so the commands above work in a plain terminal; the user unit also carries explicit `Environment=` lines for the same paths. Nothing in `polish.py` changes — the indicator is a separate process with no network (`RestrictAddressFamilies=AF_UNIX`), not in the `input` group, running as you.
 
 `INDICATOR=0 ./install.sh indicator` disables the unit again.
 
@@ -167,10 +167,12 @@ Dependencies (apt): `python3-gi python3-gi-cairo gir1.2-gtk-4.0`. gtk4-layer-she
 ```bash
 echo "hello from ydotool" | wl-copy
 # click into COSMIC Text Editor, then within 3 s:
-sleep 3 && ydotool key shift+insert
+sleep 3 && ydotool key -d 60 42:1 110:1 110:0 42:0    # shift+insert; see the note below
 ```
 
 Text must appear. If not: `systemctl --user status ydotool`, `ls -l /dev/uinput` (group should match your mode, mode 660), `echo $YDOTOOL_SOCKET`.
+
+The numeric arguments are not decoration. ydotool 1.x takes `keycode:state` pairs (42 = `KEY_LEFTSHIFT`, 110 = `KEY_INSERT`), and it **exits 0 without injecting anything** when handed a 0.x-style name like `shift+insert` — so the older form looks like a silent install failure rather than a bad command. `-d 60` matches `type_delay_ms` so the probe behaves like the real paste path in Electron apps (see §Troubleshooting). Voxtype itself parses `paste_keys = "shift+insert"` and calls ydotool with these same codes.
 
 **Step 7 — LLM probe (no microphone yet)**
 

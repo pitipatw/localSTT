@@ -665,7 +665,7 @@ step_summary() {
   step "next: manual checks"
   cat <<EOF
   1. $( ((NEED_RELOGIN)) && echo "LOG OUT AND BACK IN (new group membership), then re-run: ./install.sh" || echo "no re-login needed" )
-  2. Paste probe:  echo hello | wl-copy; focus an editor; sleep 3 && ydotool key shift+insert
+  2. Paste probe:  echo hello | wl-copy; focus an editor; sleep 3 && ydotool key -d 60 42:1 110:1 110:0 42:0
   3. LLM probe:    dictate test "send it monday actually delete that send it friday"
   4. Mic probe:    $( [[ $HOTKEY_MODE == toggle ]] && echo "press your toggle shortcut, say 'testing one two three', press again" || echo "hold the F13 key, say 'testing one two three', release" ) → text appears
   5. Mic-in-use check: run  pw-top  and confirm a voxtype capture stream exists ONLY while recording

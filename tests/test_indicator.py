@@ -2,6 +2,7 @@
 Run: pytest -q tests/"""
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -119,3 +120,47 @@ def test_i5_pipewire_watcher_without_pw_dump_is_inactive(monkeypatch):
     assert w.query() is False
     w.start()   # interval 0: no thread, no crash
     w.stop()
+
+
+# I6 library / typelib discovery --------------------------------------------
+def test_i6_explicit_override_is_tried_first():
+    os.environ["GTK4_LAYER_SHELL_LIB"] = "/explicit/libgtk4-layer-shell.so.0"
+    try:
+        assert indicator.layer_shell_candidates()[0] == "/explicit/libgtk4-layer-shell.so.0"
+    finally:
+        del os.environ["GTK4_LAYER_SHELL_LIB"]
+
+
+def test_i6_user_build_is_a_candidate_without_any_env(monkeypatch):
+    monkeypatch.delenv("GTK4_LAYER_SHELL_LIB", raising=False)
+    c = indicator.layer_shell_candidates()
+    assert all(c), "no None entries may reach CDLL"
+    assert os.path.join(indicator.USER_LIB, "libgtk4-layer-shell.so.0") in c
+    assert c[-1] == "libgtk4-layer-shell.so", "bare loader names stay last"
+
+
+def test_i6_user_typelib_appended_once(monkeypatch, tmp_path):
+    typelib = tmp_path / "girepository-1.0"
+    typelib.mkdir()
+    monkeypatch.setattr(indicator, "USER_TYPELIB", str(typelib))
+    monkeypatch.delenv("GI_TYPELIB_PATH", raising=False)
+    indicator._add_user_typelib_path()
+    assert os.environ["GI_TYPELIB_PATH"] == str(typelib)
+    indicator._add_user_typelib_path()
+    assert os.environ["GI_TYPELIB_PATH"] == str(typelib), "must not duplicate"
+
+
+def test_i6_existing_typelib_path_keeps_priority(monkeypatch, tmp_path):
+    typelib = tmp_path / "girepository-1.0"
+    typelib.mkdir()
+    monkeypatch.setattr(indicator, "USER_TYPELIB", str(typelib))
+    monkeypatch.setenv("GI_TYPELIB_PATH", "/distro/typelibs")
+    indicator._add_user_typelib_path()
+    assert os.environ["GI_TYPELIB_PATH"] == "/distro/typelibs" + os.pathsep + str(typelib)
+
+
+def test_i6_absent_user_typelib_is_a_noop(monkeypatch, tmp_path):
+    monkeypatch.setattr(indicator, "USER_TYPELIB", str(tmp_path / "nope"))
+    monkeypatch.delenv("GI_TYPELIB_PATH", raising=False)
+    indicator._add_user_typelib_path()
+    assert "GI_TYPELIB_PATH" not in os.environ
