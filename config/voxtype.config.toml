@@ -1,4 +1,7 @@
-# ~/.config/voxtype/config.toml — template for Pop!_OS COSMIC (Wayland)
+# ~/.config/voxtype/config.toml — template for Pop!_OS COSMIC (Wayland), used in BOTH hotkey modes.
+# Voxtype never reads the keyboard itself (no `input` group). It is driven by `voxtype record ...`:
+#   toggle:       a COSMIC custom shortcut runs `voxtype record toggle`
+#   push_to_talk: the sandboxed hotkeyd daemon + hotkey-relay run `voxtype record start|stop` on F13
 # Installed by install.sh. Field names verified against voxtype.io/docs/CONFIGURATION (Sept 2026).
 # If `voxtype configure` or the daemon log complains about an unknown key, check that page.
 
@@ -11,12 +14,10 @@ max_duration_secs = 60     # hard cap: the daemon stops and transcribes on its o
                            # 10 s are shown as an amber pulse by dictate-indicator. Raise for long dictation.
 
 [hotkey]
-key = "F13"                # physical key remapped to F13 in the keyboard firmware (VIA/QMK). Must be a
-                           # NON-modifier: a bare Ctrl press/release leaves Electron apps (Claude, VS Code,
-                           # Slack) with stale modifier state and the paste chord is ignored there.
+key = "F13"                # ignored: enabled = false below (hotkeyd watches F13 in push_to_talk mode)
 modifiers = []
-mode = "push_to_talk"      # evdev listener; requires membership in the `input` group
-enabled = true
+mode = "toggle"
+enabled = false            # no evdev listener in Voxtype → no `input` group for your user
 cancel_key = "ESC"
 
 [parakeet]
@@ -35,7 +36,7 @@ fallback_to_clipboard = true
 driver_order = ["ydotool", "clipboard"]   # never wtype/eitype on COSMIC (types digits instead of text)
 
 [output.post_process]
-command = "/home/pitipatw/.local/bin/polish.py"   # symlink -> ~/dev/localSTT/polish.py
+command = "/home/pitipatw/.local/bin/polish.py"   # installed copy of ~/dev/localSTT/polish.py
 timeout_ms = 6000                                 # polish.py itself gives up on Ollama after 4 s
 
 [osd]

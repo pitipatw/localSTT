@@ -1,0 +1,56 @@
+# managed by localSTT v1 — install.sh fills in your user name and writes this to /etc/systemd/system/
+#
+# The only process on the machine that reads the keyboard for dictation. It runs as its own
+# system user in group `input`, so your login session never needs that group. Everything below
+# the [Service] line locks it down to: read /dev/input, write one socket under /run/hotkeyd.
+# Check with: systemd-analyze security hotkeyd   (target: under 3)
+[Unit]
+Description=localSTT hotkey daemon (F13 hold -> start/stop on a socket)
+Documentation=file:///usr/local/lib/hotkeyd/hotkeyd.py
+
+[Service]
+ExecStart=/usr/bin/python3 -u /usr/local/lib/hotkeyd/hotkeyd.py
+User=hotkeyd
+Group=hotkeyd
+SupplementaryGroups=input
+Restart=always
+RestartSec=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# /run/hotkeyd is created by /etc/tmpfiles.d/hotkeyd.conf as 2750 hotkeyd:@USER@, not by
+# RuntimeDirectory= — systemd re-applies a runtime directory's owner and mode on every Exec*
+# invocation, which silently undoes any ExecStartPre chgrp/chmod before ExecStart runs.
+# ProtectSystem=strict makes /run read-only, so the directory is opened back up explicitly.
+# Nothing removes the socket on stop now that RuntimeDirectory= is gone, and bind() fails on a
+# stale one, so clear it first. The `+` runs that line as root, outside the sandbox.
+ReadWritePaths=/run/hotkeyd
+ExecStartPre=+/bin/rm -f /run/hotkeyd/hotkey.sock
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+DevicePolicy=closed
+DeviceAllow=char-input r
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+UMask=0117
+
+[Install]
+WantedBy=multi-user.target

@@ -14,23 +14,38 @@ On a Linux desktop there is no per-application microphone permission for native 
 
 The realistic microphone threat is a compromised user account, and that threat exists with or without this project. The mitigations for it are the usual ones: full-disk encryption, not running untrusted software as your user, keeping the system updated.
 
-### 1.2 The `input` group — the one real trade-off
+### 1.2 Hold-to-talk without the `input` group
 
-Wayland's security model keeps applications from seeing each other's keystrokes. Voxtype's hold-to-talk needs to see the dictation key's press *and release* no matter which window is focused, and the only way to do that on COSMIC is to read the keyboard at the evdev level, which requires your user to be in the `input` group.
+Wayland's security model keeps applications from seeing each other's keystrokes. Hold-to-talk needs to see the dictation key's press *and release* no matter which window is focused, and the only way to do that on COSMIC is to read the keyboard at the evdev level — which requires membership in the `input` group.
 
-Being in `input` means **every process running as you can read every keystroke** from `/dev/input/event*` — a user-level keylogger no longer needs root and can capture passwords typed into terminals, browsers, or sudo prompts. It also grants write access to `/dev/uinput` (needed for pasting), which lets any user process inject keystrokes.
+Being in `input` means **every process running as that account can read every keystroke** from `/dev/input/event*` — a user-level keylogger no longer needs root and can capture passwords typed into terminals, browsers, or sudo prompts. Earlier versions of this project put *your* user in `input` for push-to-talk. That path is gone. Instead, the keyboard is read by a dedicated system user whose only process is small enough to audit in a minute:
 
-You have two choices:
+```
+/dev/input/event*  ──read──▶  hotkeyd   (system user `hotkeyd`, group `input`, sandboxed, 80 lines)
+                                 │  one line per transition: "start" / "stop" — nothing else, no key codes
+                                 ▼
+                    /run/hotkeyd/hotkey.sock   (0660, hotkeyd:<you>; hotkeyd never reads from it)
+                                 │
+                                 ▼
+                    hotkey-relay  (user service, runs as you, NOT in `input`)
+                                 │  voxtype record start | voxtype record stop
+                                 ▼
+                    voxtype daemon (user service; its own hotkey listener is disabled)
+```
 
-| | Push-to-talk (`HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1`) | Toggle mode (default) |
+| | Push-to-talk (`HOTKEY_MODE=push_to_talk`) | Toggle mode (default) |
 |---|---|---|
 | Feel | Hold the F13 key, speak, release | Press shortcut, speak, press again |
-| Group added | `input` (read all keyboards + uinput) | `uinput` only (inject, cannot read keyboard) |
-| Hotkey mechanism | Voxtype evdev listener | COSMIC custom shortcut → `voxtype record toggle` |
-| Keylogger exposure | any user process can read keystrokes | unchanged from stock Wayland |
-| Keystroke injection | any user process | any user process (unavoidable — pasting needs it) |
+| Group added to *your* user | `uinput` only | `uinput` only |
+| Who reads the keyboard | `hotkeyd` system user (`/usr/local/lib/hotkeyd/hotkeyd.py`, root-owned) | nobody — COSMIC delivers the shortcut |
+| Hotkey mechanism | hotkeyd → socket → hotkey-relay → `voxtype record start\|stop` | COSMIC custom shortcut → `voxtype record toggle` |
+| Keylogger exposure for your processes | unchanged from stock Wayland | unchanged from stock Wayland |
+| Keystroke injection | any user process (unavoidable — pasting needs it) | same |
+| What a compromise of your account learns | *when* you dictate (start/stop on the socket) | nothing new |
 
-Toggle mode is the default because the `input`-group exposure is silent and permanent, while toggle mode's failure — forgetting to stop the recording — is something you notice, and the output sanitizer (§1.6) makes it harmless in a terminal. The push-to-talk trade is what most people running evdev dictation on Wayland accept, and on a single-user machine with disk encryption it is defensible; the installer makes you say so explicitly with `I_ACCEPT_INPUT_GROUP=1`. The chosen mode is remembered in `~/.config/dictate/hotkey_mode`, so a plain re-run keeps it. To switch, re-run with the other `HOTKEY_MODE` and remove yourself from the group you no longer need (`sudo gpasswd -d $USER input`).
+What you are trusting in push-to-talk mode is `hotkeyd.py`: 80 lines of standard-library Python, capped by the installer, with a unit test for the event decoder and the press/release/hold-cap state machine (`tests/test_hotkeyd.py`). It opens only `/dev/input/event*` devices that advertise `KEY_F13`, drops every other key code before looking at it, never logs, and emits `stop` on its own if the key has been down for 60 s. Its systemd unit has no network namespace, no home, no writable filesystem beyond `/run/hotkeyd`, an empty capability set, and read-only access to input devices (`DevicePolicy=closed` + `DeviceAllow=char-input r`); `systemd-analyze security hotkeyd` should score under 3 and the installer prints the score. Any pull request that adds a feature to `hotkeyd.py` (more keys, chords, logging, config) erodes this story and should be rejected.
+
+Toggle mode is still the default because it adds no process at all. Its failure mode — forgetting to stop the recording — is something you notice, and the output sanitizer (§1.6) makes it harmless in a terminal. The chosen mode is remembered in `~/.config/dictate/hotkey_mode`, so a plain re-run keeps it. To switch, re-run with the other `HOTKEY_MODE`; switching to toggle disables hotkeyd and the relay. If an older install put you in `input`, the installer tells you so — remove it with `sudo gpasswd -d $USER input` and log out.
 
 ### 1.3 Supply chain — what you are trusting
 
@@ -90,12 +105,12 @@ git init && git add -A && git commit -m "initial dictation stack"
 **Step 2 — run the installer**
 
 ```bash
-./install.sh                                                     # toggle mode (default; adds you to `uinput` only)
+./install.sh                              # toggle mode (default; adds you to `uinput` only)
 # or
-HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1 ./install.sh     # push-to-talk (adds you to `input`; see §1.2)
+HOTKEY_MODE=push_to_talk ./install.sh     # hold-to-talk via the sandboxed hotkeyd service (§1.2; still `uinput` only)
 ```
 
-It asks for your sudo password for: apt installs, the `/dev/uinput` udev rule, the group change, extracting Ollama to `/usr/local`, and creating the `ollama` user and system service. Everything else is under your home directory. `INDICATOR=0 ./install.sh` skips the recording indicator (Step 5a) — not recommended in toggle mode. Each `==` section ends with green ✔ lines; a yellow `!` is informational; a red ✘ stops the run and says why.
+It asks for your sudo password for: apt installs, the `/dev/uinput` udev rule, the `uinput` group change, extracting Ollama to `/usr/local`, creating the `ollama` user and system service, and — in push-to-talk mode — the `hotkeyd` user, `/usr/local/lib/hotkeyd/hotkeyd.py` and its system service. Everything else is under your home directory. `INDICATOR=0 ./install.sh` skips the recording indicator (Step 5a) — not recommended in toggle mode. Each `==` section ends with green ✔ lines; a yellow `!` is informational; a red ✘ stops the run and says why.
 
 The slow parts are the Parakeet download (~2.5 GB) and `ollama pull qwen3:8b` (~5 GB). Downloads are cached in `~/.cache/localstt-downloads` so a re-run does not fetch them again.
 
@@ -170,7 +185,7 @@ echo "hello from ydotool" | wl-copy
 sleep 3 && ydotool key -d 60 42:1 110:1 110:0 42:0    # shift+insert; see the note below
 ```
 
-Text must appear. If not: `systemctl --user status ydotool`, `ls -l /dev/uinput` (group should match your mode, mode 660), `echo $YDOTOOL_SOCKET`.
+Text must appear. If not: `systemctl --user status ydotool`, `ls -l /dev/uinput` (group `uinput`, mode 660), `echo $YDOTOOL_SOCKET`.
 
 The numeric arguments are not decoration. ydotool 1.x takes `keycode:state` pairs (42 = `KEY_LEFTSHIFT`, 110 = `KEY_INSERT`), and it **exits 0 without injecting anything** when handed a 0.x-style name like `shift+insert` — so the older form looks like a silent install failure rather than a bad command. `-d 60` matches `type_delay_ms` so the probe behaves like the real paste path in Electron apps (see §Troubleshooting). Voxtype itself parses `paste_keys = "shift+insert"` and calls ydotool with these same codes.
 
@@ -184,7 +199,7 @@ Expect `[llm]` and something like `final: Send it Friday.` If you see `[llm_erro
 
 **Step 8 — first dictation**
 
-Click into the text editor. Toggle (default): press your shortcut from Step 5, say "testing one two three", press it again. Push-to-talk: hold the F13 key, speak, release. Text should appear in about a second. If nothing happens, run `journalctl --user -u voxtype -f` in another terminal and try again. Common causes: the daemon is not running (`systemctl --user status voxtype`), the hotkey is not seen (group membership not yet active — did you log out?), or the paste landed in another window (an overlay stole focus — keep any OSD disabled).
+Click into the text editor. Toggle (default): press your shortcut from Step 5, say "testing one two three", press it again. Push-to-talk: hold the F13 key, speak, release. Text should appear in about a second. If nothing happens, run `journalctl --user -u voxtype -f` in another terminal and try again. Common causes: the daemon is not running (`systemctl --user status voxtype`), the hotkey is not seen (toggle: the COSMIC binding; push-to-talk: `systemctl status hotkeyd`, `systemctl --user status hotkey-relay`), the paste failed (`uinput` group not yet active — did you log out?), or the paste landed in another window (an overlay stole focus — keep any OSD disabled).
 
 **Step 9 — GPU check**
 
@@ -215,7 +230,8 @@ Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture str
 | Location | What | Remove with |
 |---|---|---|
 | `/etc/udev/rules.d/80-uinput.rules`, `/etc/modules-load.d/uinput.conf` | uinput device group/mode | `sudo rm` both, `sudo udevadm control --reload-rules` |
-| group membership `input` or `uinput` | evdev / uinput access | `sudo gpasswd -d $USER input` (or `uinput`) |
+| group membership `uinput` | uinput access (pasting) | `sudo gpasswd -d $USER uinput` |
+| user `hotkeyd`, `/usr/local/lib/hotkeyd/hotkeyd.py`, `/etc/systemd/system/hotkeyd.service`, `~/.local/bin/hotkey-relay`, `~/.config/systemd/user/hotkey-relay.service` (push-to-talk only) | hold-to-talk keyboard reader + relay | `systemctl --user disable --now hotkey-relay; sudo systemctl disable --now hotkeyd; sudo rm -rf /usr/local/lib/hotkeyd /etc/systemd/system/hotkeyd.service; sudo userdel hotkeyd`, then delete the two user files |
 | `/usr/local/bin/ollama`, `/usr/local/lib/ollama/`, `/etc/systemd/system/ollama.service`, user `ollama`, `/usr/share/ollama/` (models) | Ollama | `sudo systemctl disable --now ollama; sudo rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /etc/systemd/system/ollama.service; sudo userdel -r ollama` |
 | `~/.local/lib/voxtype/`, `~/.local/bin/voxtype` (wrapper), `~/.local/bin/polish.py`, `~/.local/bin/dictate` | Voxtype + hooks | `rm -rf` those paths |
 | `~/.local/bin/dictate-indicator`, `~/.config/systemd/user/dictate-indicator.service`, `~/.local/lib/libgtk4-layer-shell*`, `~/.local/lib/girepository-1.0/Gtk4LayerShell-1.0.typelib`, `~/.local/include/gtk4-layer-shell/`, `~/.local/lib/pkgconfig/gtk4-layer-shell-0.pc`, `~/.local/share/gir-1.0/Gtk4LayerShell-1.0.gir` | recording indicator | `systemctl --user disable --now dictate-indicator`, then delete |
@@ -228,7 +244,7 @@ Run `pw-top` in a terminal. While idle, there should be no `voxtype` capture str
 
 ## 5. Hotkey: why F13, and the modifier-key trap
 
-This section is about **push-to-talk**, where Voxtype reads the key itself. In toggle mode the key is a COSMIC shortcut (Step 5) and none of the following applies — there a modifier combo is the *preferred* choice.
+This section is about **push-to-talk**, where `hotkeyd` reads the key at the evdev level (it looks for `KEY_F13`, code 183, and nothing else). In toggle mode the key is a COSMIC shortcut (Step 5) and none of the following applies — there a modifier combo is the *preferred* choice.
 
 The dictation key must be a **non-modifier** key. The first choice, Right Ctrl, worked in COSMIC Text Editor but not in Electron apps (the Claude desktop app, and by extension VS Code, Slack, Discord). What happens: holding and releasing a bare modifier — with no other key — leaves Chromium's internal modifier state stale on Wayland. When Voxtype then sends the paste chord about a second later, Electron reads `shift+insert` as `Ctrl+Shift+Insert` and ignores it. Reproduced by hand: press and release Right Ctrl in the Claude box, then fire `ydotool key -d 60 42:1 110:1 110:0 42:0` — nothing pastes; without the Ctrl press, it pastes.
 
@@ -250,13 +266,13 @@ Related, found on the same path: Electron also needs more than ydotool's default
 |---|---|
 | `ydotoold not running` on first run | Expected before re-login. Log out/in, re-run. |
 | `status=203/EXEC` or `ydotoold binary not found` | Debian/Ubuntu split the daemon into a separate `ydotoold` package; the `ydotool` package is only the client. The installer installs `ydotoold` via apt, or builds ydotool 1.0.4 from source into `~/.local/bin` if the package is unavailable. |
-| `ydotool key` does nothing | `ls -l /dev/uinput` group matches your mode; `id -nG` includes it; `echo $YDOTOOL_SOCKET` matches `systemctl --user show ydotool -p ExecStart` |
+| `ydotool key` does nothing | `ls -l /dev/uinput` is group `uinput`; `id -nG` includes it; `echo $YDOTOOL_SOCKET` matches `systemctl --user show ydotool -p ExecStart` |
 | Text comes out as digits | A `wtype`/`eitype` driver got used. `driver_order` must start with `ydotool`. |
 | Paste lands in the wrong window | Disable any Voxtype OSD/overlay. |
 | `[llm_error]` in `dictate test` | `systemctl status ollama`, `ss -ltn \| grep 11434`, `ollama list` |
 | Transcription slow (~1 s+) | GPU fallback to CPU; see step 9. |
 | Checksum mismatch | Delete `~/.cache/localstt-downloads/*` and re-run. If it persists, do not install — the release may have been re-uploaded or tampered with; compare against the GitHub release page. |
-| Hotkey ignored in push-to-talk | `id -nG \| grep input`; `journalctl --user -u voxtype` for "permission denied" on `/dev/input`; `evtest` to confirm the key's evdev name matches `key = …` |
+| Hotkey ignored in push-to-talk | `systemctl status hotkeyd` and `systemctl --user status hotkey-relay` (both must be active); `sudo journalctl -u hotkeyd` for "permission denied" on `/dev/input`; `sudo stat -c '%a %U %G' /run/hotkeyd` must be `2750 hotkeyd <you>` (setgid, your group — if it is `750 hotkeyd hotkeyd` the tmpfiles rule in `/etc/tmpfiles.d/hotkeyd.conf` did not apply, and you cannot even traverse the directory) and `sudo ls -l /run/hotkeyd/hotkey.sock` must be `660 hotkeyd:<you>`; `sudo evtest` to confirm the keyboard reports `KEY_F13` (hotkeyd ignores every other code) |
 | Pastes in GTK apps but not Electron (Claude, VS Code) | Hotkey is a modifier key → §5. Also check `type_delay_ms = 60`. |
 | `4114` (or other digits) typed instead of a paste | ydotool client is pre-1.0 → §5; `./install.sh ydotool` builds 1.0.4. |
 | Daemon logs `Loading Parakeet … model` and nothing after; 0 % CPU | CUDA build hung in its CPU fallback (no CUDA runtime installed). `VOXTYPE_VARIANT=cpu ./install.sh voxtype` for the avx2 build, or install CUDA 13 runtime + cuDNN 9. |

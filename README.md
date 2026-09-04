@@ -16,7 +16,8 @@ Local, offline push-to-talk dictation for Linux (Pop!_OS + COSMIC on Wayland). H
 ## How it works
 
 ```
-hold F13 ──evdev──▶ Voxtype daemon ── records mic (PipeWire) ── release
+hold F13 ──evdev──▶ hotkeyd (sandboxed) ──socket──▶ hotkey-relay ──▶ Voxtype daemon ── records mic (PipeWire) ── release
+   (or: COSMIC shortcut ──▶ voxtype record toggle ──▶ Voxtype daemon)
                           │
               Parakeet TDT 0.6B v3 (ONNX, ~0.2 s on CPU)
                           │  raw text
@@ -44,8 +45,8 @@ git clone git@github.com:pitipatw/localSTT.git ~/dev/localSTT
 cd ~/dev/localSTT
 chmod +x install.sh polish.py dictate indicator.py tests/latency_report.py
 ./install.sh                     # toggle mode (default): press the shortcut to start, again to stop
-# push-to-talk instead (adds you to the `input` group — every user process can then read the keyboard):
-#   HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1 ./install.sh
+# hold-to-talk instead (F13 read by a tiny sandboxed system service — you are NOT added to the `input` group):
+#   HOTKEY_MODE=push_to_talk ./install.sh
 # log out and back in when it says so, then ./install.sh again
 ```
 
@@ -113,20 +114,25 @@ localSTT/
 ├── dictate                      CLI: fix / unfix / snippet / jargon / list / test / log / app
 ├── indicator.py                 → ~/.local/bin/dictate-indicator  screen-edge glow while the mic is open
 ├── config/
-│   ├── voxtype.config.toml      → ~/.config/voxtype/config.toml
-│   ├── voxtype.config.toggle.toml  toggle-mode variant (no `input` group)
+│   ├── voxtype.config.toml      → ~/.config/voxtype/config.toml  (Voxtype's own hotkey listener off in both modes)
 │   ├── prompt.md                → ~/.config/dictate/   system prompt + demonstrations
 │   ├── corrections.json         → ~/.config/dictate/   "heard phrase" → "Spelling"
 │   ├── snippets.json            → ~/.config/dictate/   spoken trigger → text
 │   ├── jargon.txt               → ~/.config/dictate/   one term per line
 │   └── settings.json            → ~/.config/dictate/   model, timeouts, guard thresholds, log privacy
+├── hotkeyd/
+│   ├── hotkeyd.py               → /usr/local/lib/hotkeyd/  80-line evdev reader, runs as system user `hotkeyd`
+│   └── hotkey-relay             → ~/.local/bin/  socket → `voxtype record start|stop`, runs as you
 ├── systemd/
 │   ├── ydotool.service          user unit for the built ydotoold
+│   ├── hotkeyd.service          sandboxed system unit for hotkeyd (push-to-talk only)
+│   ├── hotkey-relay.service     user unit for the relay (push-to-talk only)
 │   └── dictate-indicator.service  user unit for the recording indicator (no network, AF_UNIX only)
-├── docs/feature-requests/       design notes for follow-ups (01 recording indicator: done; 02 hotkey daemon)
+├── docs/feature-requests/       design notes (01 recording indicator: done; 02 hotkey daemon: done)
 └── tests/
-    ├── test_polish.py           unit tests for the hook, LLM mocked — `pytest -q tests/`
+    ├── test_polish.py           unit tests for polish.py, LLM mocked — `pytest -q tests/`
     ├── test_indicator.py        unit tests for the indicator's state logic, no GTK
+    ├── test_hotkeyd.py          event decoder, hold-cap state machine, relay allow-list
     └── latency_report.py        `dictate log stats`
 ```
 
@@ -154,7 +160,7 @@ Three findings from getting this working on COSMIC, each documented in INSTALL.m
 | Few-shot examples | prose in the system prompt | Sent as real user/assistant turns; an 8B model imitates demonstrations far better than it follows descriptions. |
 | Hotkey | TBD | F13 (see above). |
 | Installs | latest release, `curl \| sh` | Pinned versions **and digests** (tarball sha256, git commit, model blob, every Parakeet file), GPG signature required for Voxtype, Ollama bound to `127.0.0.1` under its own sandboxed system user. |
-| Hotkey privilege | `input` group | Toggle mode is the default (`uinput` group only). Push-to-talk needs `input` and an explicit `I_ACCEPT_INPUT_GROUP=1`. INSTALL.md §1.2. |
+| Hotkey privilege | `input` group | Your user is never in `input`. Toggle mode (default) uses a COSMIC shortcut; hold-to-talk runs an 80-line sandboxed `hotkeyd` system service that reports F13 press/release on a socket. INSTALL.md §1.2. |
 | Dictation log | plaintext, forever | Metadata-only by default; `log_text`/`log_enabled` settings, mode 600, `dictate log purge`. |
 | Pasted text | whatever the LLM returned | Control characters stripped; newlines off unless `allow_newlines`, never in terminals. |
 
