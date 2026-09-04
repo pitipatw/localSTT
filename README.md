@@ -1,5 +1,7 @@
 # localSTT
 
+[![CI](https://github.com/pitipatw/localSTT/actions/workflows/ci.yml/badge.svg)](https://github.com/pitipatw/localSTT/actions/workflows/ci.yml)
+
 Local, offline push-to-talk dictation for Linux (Pop!_OS + COSMIC on Wayland). Hold a key, speak, release: a cleaned-up transcript is pasted at the cursor about a second later. A replacement for Wispr Flow with no cloud, no account, no subscription — nothing leaves the machine.
 
 **Status:** working daily driver as of 2026-09-02 — verified in COSMIC Text Editor, VS Code, Edge and the Claude desktop app. Known exception: COSMIC Terminal (see below).

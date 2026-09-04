@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Unit tests
+        run: python -m pytest -q tests/
+
+      - name: Shell syntax
+        run: bash -n install.sh
+
+      - name: Shell lint
+        # Gate at warning. The 9 findings on v1.0 are all info-level (SC2012 x3 on
+        # display-only `ls` calls, SC2015 x6 on `A && B || C`); a later roadmap row can
+        # clean them and raise this to the default severity. The full list is printed
+        # below so it stays visible rather than being silently dropped.
+        run: |
+          shellcheck -S warning install.sh
+          echo "--- informational findings (not gating) ---"
+          shellcheck -f gcc install.sh || true
+
+      - name: Byte-compile every Python entry point
+        run: |
+          files=$(git ls-files '*.py')
+          for f in dictate hotkeyd/hotkey-relay; do [ -f "$f" ] && files="$files $f"; done
+          echo "compiling: $files"
+          python -m py_compile $files
