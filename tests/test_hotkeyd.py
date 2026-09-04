@@ -108,3 +108,40 @@ def test_hold_cap_can_fire_in_the_same_read_as_a_new_press():
 ])
 def test_relay_accepts_only_start_and_stop(line, expected):
     assert relay.command_for(line) == expected
+
+
+# H6 runtime-directory wiring ------------------------------------------------
+# Regression guard for a bug found on pop-os: the unit used RuntimeDirectory= plus an
+# ExecStartPre chgrp/chmod to give /run/hotkeyd the user's group and the setgid bit. systemd
+# rebuilds a runtime directory's owner and mode for every Exec* invocation, so the ExecStartPre
+# was undone before ExecStart ran; the socket came out hotkeyd:hotkeyd inside a 0750
+# hotkeyd:hotkeyd directory, unreachable by the relay.
+UNIT = (ROOT / "systemd" / "hotkeyd.service").read_text()
+TMPFILES = (ROOT / "systemd" / "hotkeyd.tmpfiles.conf").read_text()
+# directives only: the comments in both files describe the bug and name the directives involved
+UNIT_DIRECTIVES = "\n".join(l for l in UNIT.splitlines() if l and not l.startswith("#"))
+
+
+def test_h6_unit_does_not_manage_the_runtime_directory():
+    assert "RuntimeDirectory=" not in UNIT_DIRECTIVES, \
+        "systemd re-applies RuntimeDirectory owner/mode per Exec*, undoing any ExecStartPre chgrp"
+    assert "chgrp" not in UNIT_DIRECTIVES, "the group is set by the tmpfiles rule, not an ExecStartPre"
+
+
+def test_h6_unit_can_still_write_the_runtime_directory_and_clears_a_stale_socket():
+    assert "ProtectSystem=strict" in UNIT
+    assert "ReadWritePaths=/run/hotkeyd" in UNIT, "ProtectSystem=strict makes /run read-only"
+    assert "ExecStartPre=+/bin/rm -f /run/hotkeyd/hotkey.sock" in UNIT, \
+        "nothing cleans the socket on stop now; bind() fails on a stale one"
+
+
+def test_h6_tmpfiles_rule_is_setgid_and_owned_by_the_user_group():
+    rules = [l for l in TMPFILES.splitlines() if l and not l.startswith("#")]
+    assert rules == ["d /run/hotkeyd 2750 hotkeyd @USER@ -"]
+
+
+def test_h6_installer_renders_and_applies_the_tmpfiles_rule():
+    sh = (ROOT / "install.sh").read_text()
+    assert 'render_unit "$REPO/systemd/hotkeyd.tmpfiles.conf"' in sh
+    assert "systemd-tmpfiles --create" in sh
+    assert '"2750 hotkeyd $ME"' in sh, "the installer must verify the directory it just created"

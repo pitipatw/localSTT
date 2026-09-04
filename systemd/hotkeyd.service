@@ -17,11 +17,14 @@ Restart=always
 RestartSec=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 
-# /run/hotkeyd: owned by hotkeyd, group @USER@, setgid so the socket inherits that group
-# and comes out 0660 (hotkeyd rw, you rw, nobody else). The `+` runs this one line as root.
-RuntimeDirectory=hotkeyd
-RuntimeDirectoryMode=0750
-ExecStartPre=+/bin/sh -c 'chgrp @USER@ /run/hotkeyd && chmod 2750 /run/hotkeyd'
+# /run/hotkeyd is created by /etc/tmpfiles.d/hotkeyd.conf as 2750 hotkeyd:@USER@, not by
+# RuntimeDirectory= — systemd re-applies a runtime directory's owner and mode on every Exec*
+# invocation, which silently undoes any ExecStartPre chgrp/chmod before ExecStart runs.
+# ProtectSystem=strict makes /run read-only, so the directory is opened back up explicitly.
+# Nothing removes the socket on stop now that RuntimeDirectory= is gone, and bind() fails on a
+# stale one, so clear it first. The `+` runs that line as root, outside the sandbox.
+ReadWritePaths=/run/hotkeyd
+ExecStartPre=+/bin/rm -f /run/hotkeyd/hotkey.sock
 
 NoNewPrivileges=yes
 ProtectSystem=strict

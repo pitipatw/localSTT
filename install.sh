@@ -663,6 +663,22 @@ step_hotkeyd() {
     sudo install -D -o root -g root -m 0755 "$src" "$HOTKEYD_LIB/hotkeyd.py"
     ok "installed $HOTKEYD_LIB/hotkeyd.py ($lines lines, root-owned)"
   fi
+  # /run/hotkeyd must be 2750 hotkeyd:$ME before the daemon binds, so the socket inherits your
+  # group. This is a tmpfiles rule, not RuntimeDirectory= + ExecStartPre: systemd re-applies a
+  # runtime directory's owner and mode for every Exec* invocation and undoes the ExecStartPre.
+  local tmpfiles=/etc/tmpfiles.d/hotkeyd.conf rendered_tmp
+  rendered_tmp=$(render_unit "$REPO/systemd/hotkeyd.tmpfiles.conf")
+  if [[ -f $tmpfiles ]] && cmp -s <(printf '%s\n' "$rendered_tmp") "$tmpfiles"; then
+    ok "$tmpfiles up to date"
+  else
+    printf '%s\n' "$rendered_tmp" | sudo tee "$tmpfiles" >/dev/null
+    ok "wrote $tmpfiles"
+  fi
+  sudo systemd-tmpfiles --create "$tmpfiles"
+  local dirperms; dirperms=$(sudo stat -c '%a %U %G' /run/hotkeyd)
+  [[ $dirperms == "2750 hotkeyd $ME" ]] || fail "/run/hotkeyd is '$dirperms', expected '2750 hotkeyd $ME' — the socket cannot inherit your group; check $tmpfiles"
+  ok "/run/hotkeyd is $dirperms (setgid: the socket inherits group $ME)"
+
   local rendered; rendered=$(render_unit "$REPO/systemd/hotkeyd.service")
   if [[ -f $HOTKEYD_UNIT ]] && cmp -s <(printf '%s\n' "$rendered") "$HOTKEYD_UNIT"; then
     ok "system unit up to date"
@@ -679,7 +695,7 @@ step_hotkeyd() {
     fail "hotkeyd is not running (log above)"
   fi
   local sock=/run/hotkeyd/hotkey.sock perms
-  [[ -S $sock ]] || fail "$sock was not created — sudo journalctl -u hotkeyd -n 20"
+  [[ -S $sock ]] || fail "$sock is not a socket you can reach — $(sudo stat -c '%a %U %G' /run/hotkeyd 2>/dev/null || echo 'no /run/hotkeyd'); sudo ls -l /run/hotkeyd; sudo journalctl -u hotkeyd -n 20"
   perms=$(stat -c '%a %U %G' "$sock")
   [[ $perms == "660 hotkeyd $ME" ]] || fail "$sock is '$perms', expected '660 hotkeyd $ME' — other users could see when you dictate; check the unit's ExecStartPre"
   ok "hotkeyd running; socket $sock (660 hotkeyd:$ME)"
