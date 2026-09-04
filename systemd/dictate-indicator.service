@@ -1,0 +1,33 @@
+# ~/.config/systemd/user/dictate-indicator.service — installed by install.sh (step: indicator)
+# Screen-edge glow while the microphone is live. See docs/feature-requests/01-recording-indicator.md.
+#
+# Fail-visible contract: the unit restarts on any exit, but if it is down while you are
+# recording there is simply no glow. No glow while you believe you are dictating = check
+# `pw-top` for a voxtype capture stream and `systemctl --user status dictate-indicator`.
+[Unit]
+Description=dictate recording indicator (screen-edge glow while the mic is open)
+PartOf=graphical-session.target
+After=graphical-session.target
+# keep retrying forever: a dead indicator is a silent one
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dictate-indicator
+Restart=always
+RestartSec=2
+# Runs as you, in no extra group. Sandboxing here is limited to what a *user* manager can
+# enforce without user namespaces (Ubuntu/Pop!_OS restrict those): seccomp and rlimits.
+# AF_UNIX only = Wayland and PipeWire sockets work, no TCP/UDP at all.
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+SystemCallArchitectures=native
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+# GTK4_LAYER_SHELL_LIB / GI_TYPELIB_PATH are appended by install.sh when gtk4-layer-shell
+# was built from source into ~/.local (no distro package on Ubuntu/Pop!_OS 24.04).
+
+[Install]
+WantedBy=graphical-session.target

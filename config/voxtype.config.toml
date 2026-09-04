@@ -6,6 +6,12 @@
 # If `voxtype configure` or the daemon log complains about an unknown key, check that page.
 
 engine = "parakeet"
+state_file = "auto"        # $XDG_RUNTIME_DIR/voxtype/state: idle | recording | streaming | transcribing.
+                           # Required by `voxtype record toggle`; read by dictate-indicator (the edge glow).
+
+[audio]
+max_duration_secs = 60     # hard cap: the daemon stops and transcribes on its own after this. The last
+                           # 10 s are shown as an amber pulse by dictate-indicator. Raise for long dictation.
 
 [hotkey]
 key = "F13"                # ignored: enabled = false below (hotkeyd watches F13 in push_to_talk mode)

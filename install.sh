@@ -6,6 +6,7 @@
 #   HOTKEY_MODE=push_to_talk ./install.sh   hold-to-talk via the sandboxed hotkeyd daemon
 #   ./install.sh --list                     show step names
 #   ./install.sh <step>...                  run only the named steps (e.g. ./install.sh voxtype model)
+#   INDICATOR=0 ./install.sh                skip the screen-edge recording indicator (on by default)
 #
 # Security posture (see INSTALL.md and SECURITY_REVIEW.md):
 #   * Nothing is piped from the network into a shell. Every download is pinned to
@@ -40,6 +41,11 @@ OLLAMA_MODEL_BLOB_SHA256="a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa4
 YDOTOOL_VERSION="1.0.4"        # only used if the distro package lacks ydotoold
 YDOTOOL_COMMIT="57ba7d0af525e82da2de0e275d169477f293b197"   # what tag v1.0.4 points at (tags can move; commits cannot)
 
+# gtk4-layer-shell powers the recording indicator overlay. Ubuntu/Pop!_OS 24.04 ship no
+# package for it, so it is built from a pinned commit into ~/.local (no sudo, no PATH change).
+LAYER_SHELL_VERSION="1.1.1"
+LAYER_SHELL_COMMIT="4867d7b85cdf1e829fc1fd6f1d5f04c42cc99389"   # what tag v1.1.1 points at
+
 PARAKEET_REV="8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce"     # commit in the HF repo, not the mutable `main`
 PARAKEET_REPO="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/$PARAKEET_REV"
 # LFS files: sha256 (from the repo's LFS pointers). Small text files are stored in git, not LFS,
@@ -68,6 +74,7 @@ HOTKEYD_LIB=/usr/local/lib/hotkeyd              # root-owned copy of hotkeyd.py:
 HOTKEYD_UNIT=/etc/systemd/system/hotkeyd.service
 RELAY_UNIT="$HOME/.config/systemd/user/hotkey-relay.service"
 ME="$(id -un)"                                  # not $USER: that is just an environment variable
+INDICATOR="${INDICATOR:-1}"                     # 0 = do not install/enable the recording indicator
 VOX_CFG_DIR="$HOME/.config/voxtype"
 MODEL_DIR="$HOME/.local/share/voxtype/models/parakeet-tdt-0.6b-v3"
 LOG_DIR="$HOME/.local/share/dictate"
@@ -490,8 +497,8 @@ step_config() {
   mkdir -p "$BIN" "$DICTATE_DIR" "$VOX_CFG_DIR" "$LOG_DIR"
   chmod 700 "$DICTATE_DIR" "$LOG_DIR"
   echo "$HOTKEY_MODE" > "$MODE_STAMP"
-  chmod +x "$REPO/polish.py" "$REPO/dictate" "$REPO/tests/latency_report.py"
-  chmod go-w "$REPO" "$REPO/polish.py" "$REPO/dictate" 2>/dev/null || true
+  chmod +x "$REPO/polish.py" "$REPO/dictate" "$REPO/indicator.py" "$REPO/tests/latency_report.py"
+  chmod go-w "$REPO" "$REPO/polish.py" "$REPO/dictate" "$REPO/indicator.py" 2>/dev/null || true
   # The hook runs with your full privileges on every dictation. Install a COPY so that what
   # runs is what you reviewed at install time, not whatever `git pull` brings in later.
   # DEV_SYMLINK=1 restores the symlink for prompt/pipeline tuning sessions.
@@ -527,6 +534,102 @@ step_config() {
   ok "wrote $cfg"
   printf 'um so uh this is a test of the polish hook with enough words' | "$BIN/polish.py" >/dev/null && ok "polish.py runs end to end (see: dictate log tail 1)"
   [[ -f "$LOG_DIR/log.jsonl" ]] && { chmod 600 "$LOG_DIR/log.jsonl"; ok "log.jsonl is mode 600"; }
+}
+
+build_layer_shell() {
+  # Source build of wmww/gtk4-layer-shell at a pinned commit into ~/.local. Prints the
+  # Environment= lines the indicator unit needs to find the library and its typelib.
+  local need=() p
+  for p in meson ninja-build libwayland-dev wayland-protocols libgtk-4-dev gobject-introspection libgirepository1.0-dev; do
+    dpkg -s "$p" >/dev/null 2>&1 || need+=("$p")
+  done
+  ((${#need[@]})) && sudo apt-get install -y "${need[@]}"
+  local src="$DL/gtk4-layer-shell-$LAYER_SHELL_VERSION"
+  if [[ ! -d $src/.git ]]; then
+    git clone --depth 1 --branch "v$LAYER_SHELL_VERSION" https://github.com/wmww/gtk4-layer-shell "$src"
+  fi
+  local head; head=$(git -C "$src" rev-parse HEAD)
+  [[ $head == "$LAYER_SHELL_COMMIT" ]] || fail "gtk4-layer-shell tag v$LAYER_SHELL_VERSION is at $head, expected $LAYER_SHELL_COMMIT (tag moved?) — rm -rf $src"
+  echo "  source: $head (tag v$LAYER_SHELL_VERSION, pinned)"
+  # no vapi (needs valac), no examples/tests/docs; smoke tests would need a running compositor
+  meson setup "$src/build" "$src" --prefix="$HOME/.local" --libdir=lib -Dintrospection=true -Dvapi=false \
+    -Dexamples=false -Ddocs=false -Dtests=false -Dsmoke-tests=false >/dev/null
+  ninja -C "$src/build" >/dev/null
+  ninja -C "$src/build" install >/dev/null
+  [[ -e "$HOME/.local/lib/libgtk4-layer-shell.so.0" && -e "$HOME/.local/lib/girepository-1.0/Gtk4LayerShell-1.0.typelib" ]] \
+    || fail "gtk4-layer-shell build did not produce the library + typelib — see $src/build"
+  ok "built gtk4-layer-shell $LAYER_SHELL_VERSION → $HOME/.local/lib"
+}
+
+step_indicator() {
+  step "recording indicator  (screen-edge glow while the mic is open; INDICATOR=$INDICATOR)"
+  local unit="$HOME/.config/systemd/user/dictate-indicator.service"
+  if [[ $INDICATOR != 1 ]]; then
+    systemctl --user disable --now dictate-indicator >/dev/null 2>&1 || true
+    warn "INDICATOR=0: indicator not enabled. In toggle mode nothing tells you the mic is still open."
+    return 0
+  fi
+  local pkgs=(python3-gi python3-gi-cairo gir1.2-gtk-4.0) missing=() p
+  for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+  ((${#missing[@]})) && sudo apt-get install -y "${missing[@]}"
+  for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 && ok "$p" || fail "$p not installed"; done
+
+  # gtk4-layer-shell: distro package where one exists (Ubuntu >= 25.10), else pinned source build.
+  local env_lines=()
+  if dpkg -s gir1.2-gtk4layershell-1.0 >/dev/null 2>&1; then
+    ok "gtk4-layer-shell from the distro package"
+  elif apt-cache show gir1.2-gtk4layershell-1.0 >/dev/null 2>&1; then
+    sudo apt-get install -y gir1.2-gtk4layershell-1.0 && ok "gtk4-layer-shell installed from the distro package"
+  else
+    if [[ -e "$HOME/.local/lib/libgtk4-layer-shell.so.0" && -e "$HOME/.local/lib/girepository-1.0/Gtk4LayerShell-1.0.typelib" && ${LAYER_SHELL_FROM_SOURCE:-0} != 1 ]]; then
+      ok "gtk4-layer-shell already built in $HOME/.local (LAYER_SHELL_FROM_SOURCE=1 to rebuild)"
+    else
+      warn "no distro package for gtk4-layer-shell — building $LAYER_SHELL_VERSION from source into $HOME/.local"
+      build_layer_shell
+    fi
+    env_lines=("Environment=GTK4_LAYER_SHELL_LIB=$HOME/.local/lib/libgtk4-layer-shell.so.0"
+               "Environment=GI_TYPELIB_PATH=$HOME/.local/lib/girepository-1.0")
+  fi
+
+  # The indicator runs as you in every session; install a reviewed COPY like polish.py.
+  if [[ ${DEV_SYMLINK:-0} == 1 ]]; then
+    ln -sfn "$REPO/indicator.py" "$BIN/dictate-indicator"
+  else
+    rm -f "$BIN/dictate-indicator"
+    install -m 0755 "$REPO/indicator.py" "$BIN/dictate-indicator"
+  fi
+  ok "installed $BIN/dictate-indicator"
+
+  mkdir -p "$(dirname "$unit")"
+  { cat "$REPO/systemd/dictate-indicator.service"
+    if ((${#env_lines[@]})); then
+      printf '\n# appended by install.sh: gtk4-layer-shell built from source\n[Service]\n'
+      printf '%s\n' "${env_lines[@]}"
+    fi
+  } > "$unit.new"
+  if [[ -f $unit ]] && cmp -s "$unit" "$unit.new"; then
+    rm -f "$unit.new"; ok "user unit up to date"
+  else
+    mv "$unit.new" "$unit"; ok "wrote $unit"
+  fi
+  systemctl --user daemon-reload
+
+  local check
+  if check=$(env "${env_lines[@]#Environment=}" "$BIN/dictate-indicator" --check 2>&1); then
+    ok "$check"
+  else
+    fail "indicator self-check failed: $check"
+  fi
+  systemctl --user reset-failed dictate-indicator >/dev/null 2>&1 || true
+  systemctl --user enable dictate-indicator >/dev/null 2>&1 || warn "could not enable dictate-indicator"
+  systemctl --user restart dictate-indicator || true
+  sleep 1
+  if systemctl --user is-active dictate-indicator >/dev/null 2>&1; then
+    ok "dictate-indicator running (glow appears only while recording; nothing drawn now is correct)"
+  else
+    journalctl --user -u dictate-indicator -n 8 --no-pager | sed 's/^/  /'
+    fail "dictate-indicator is not running (log above). Outside a Wayland session this is expected: re-run './install.sh indicator' from the desktop"
+  fi
 }
 
 render_unit() {
@@ -621,6 +724,7 @@ EOF
   if [[ $HOTKEY_MODE == toggle ]]; then
     warn "toggle mode: add a COSMIC custom shortcut (Settings → Keyboard → Custom shortcuts):"
     warn "    command: $BIN/voxtype record toggle     key: your choice (e.g. Super+Space)"
+    [[ $INDICATOR == 1 ]] && warn "toggle mode: the screen edges glow green while the mic is open; no glow = mic closed (or indicator down: check pw-top)"
   fi
 }
 
@@ -628,10 +732,11 @@ step_summary() {
   step "next: manual checks"
   cat <<EOF
   1. $( ((NEED_RELOGIN)) && echo "LOG OUT AND BACK IN (new group membership), then re-run: ./install.sh" || echo "no re-login needed" )
-  2. Paste probe:  echo hello | wl-copy; focus an editor; sleep 3 && ydotool key shift+insert
+  2. Paste probe:  echo hello | wl-copy; focus an editor; sleep 3 && ydotool key -d 60 42:1 110:1 110:0 42:0
   3. LLM probe:    dictate test "send it monday actually delete that send it friday"
   4. Mic probe:    $( [[ $HOTKEY_MODE == toggle ]] && echo "press your toggle shortcut, say 'testing one two three', press again" || echo "hold the F13 key, say 'testing one two three', release" ) → text appears
   5. Mic-in-use check: run  pw-top  and confirm a voxtype capture stream exists ONLY while recording
+     — and that the screen-edge glow is shown exactly then ($( [[ $INDICATOR == 1 ]] && echo "dictate-indicator --demo 8 tests paste-through" || echo "INDICATOR=0: not installed" ))
   6. After ~20 dictations: dictate log stats
   Logs: journalctl --user -u voxtype -f   |   dictate log tail   |   dictate log purge
 $( [[ $HOTKEY_MODE == push_to_talk ]] && echo "  Hold-to-talk: sudo journalctl -u hotkeyd -f   |   journalctl --user -u hotkey-relay -f   (your user is NOT in 'input')" )
@@ -641,7 +746,7 @@ $( [[ $HOTKEY_MODE == push_to_talk ]] && echo "  Hold-to-talk: sudo journalctl -
 EOF
 }
 
-ALL=(preflight apt ydotool ollama voxtype model config hotkeyd service summary)
+ALL=(preflight apt ydotool ollama voxtype model config indicator hotkeyd service summary)
 if [[ "${1:-}" == "--list" ]]; then printf '%s\n' "${ALL[@]}"; exit 0; fi
 if (($#)); then STEPS=("$@" summary); else STEPS=("${ALL[@]}"); fi
 for s in "${STEPS[@]}"; do
