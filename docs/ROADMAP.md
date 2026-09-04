@@ -23,7 +23,7 @@ Run on pop-os and paste the output into `docs/metrics.md` under "v1.0 baseline":
 ```bash
 git describe --tags                     # v1.0
 dictate log stats                       # latency + stage counts after ≥ 20 dictations
-pytest -q tests/ | tail -1              # 37 passed
+pytest -q tests/ | tail -1              # 60 passed
 ```
 
 Without a baseline, "faster" and "more accurate" cannot be shown. Every later step that touches
@@ -48,9 +48,12 @@ latency or accuracy appends its own before/after block to `docs/metrics.md`.
 | 12 | App-context helper (C9): investigation only | The read side exists; the write side depends on what COSMIC exposes | `docs/design/app-context.md`: what COSMIC (`cosmic-comp` IPC / `wlr-foreign-toplevel` / `ext-foreign-toplevel-list`) actually offers, a 30-line prototype if feasible, else a clear "not now"; no installer changes | cloud (research) + pop-os (prototype) | ready |
 | 13 | Release v1.1 | Roll up | `CHANGELOG.md` section, README numbers refreshed from `docs/metrics.md`, tag `v1.1` | pop-os (Pitipat runs `scripts/release.sh v1.1`, generalised from the v1.0 script) | after all merged |
 
-Deferred, not in this cycle: the recording indicator (`docs/feature-requests/01`) and hotkeyd
-(`docs/feature-requests/02`). Both are large, both are pop-os-only to verify, and both belong
-to a "1.2: toggle-mode safety" cycle once the measurement tooling above exists.
+Feature requests, merged ahead of this cycle rather than deferred to a 1.2: the recording
+indicator (`docs/feature-requests/01`) landed as `c054fa1` — it was already written, and toggle mode
+being the default makes the open-mic risk it closes worth taking early. hotkeyd
+(`docs/feature-requests/02`) follows on the same reasoning. Both were verified by observation on
+pop-os, not measured: their reports live in `docs/steps/fr0*.md` and carry checks, not numbers.
+The measurement tooling above is still what later accuracy and latency work depends on.
 
 ## Reversibility rules (summary; details in AGENTS.md)
 

@@ -9,6 +9,8 @@ names the commit or PR so a change can be found and reverted with `git revert <s
 
 - [PR #3] `2e5f14c` CI: GitHub Actions runs `pytest -q tests/`, `bash -n install.sh`, `shellcheck -S warning install.sh` and byte-compiles every Python entry point on every push and pull request; badge in README. (roadmap step 1)
 
+- [PR #4] `c054fa1` feat: screen-edge recording indicator (`docs/feature-requests/01`) — a border on every monitor while the mic is open, Voxtype state file and a PipeWire poll as independent sources, amber pulse before the 60 s cap; new `indicator` installer step and `dictate-indicator` user unit. Includes a `~/.local/lib` gtk4-layer-shell discovery fix and the ydotool 1.x keycode correction to the INSTALL.md paste probes.
+
 ## v1.0 — 2026-09-03
 
 First tagged release. Working daily driver on Pop!_OS 24.04 + COSMIC (Wayland),
