@@ -41,27 +41,31 @@ Read **[INSTALL.md](INSTALL.md)** first — its §1 covers the security trade-of
 git clone git@github.com:pitipatw/localSTT.git ~/dev/localSTT
 cd ~/dev/localSTT
 chmod +x install.sh polish.py dictate tests/latency_report.py
-./install.sh                     # or: HOTKEY_MODE=toggle ./install.sh
+./install.sh                     # toggle mode (default): press the shortcut to start, again to stop
+# push-to-talk instead (adds you to the `input` group — every user process can then read the keyboard):
+#   HOTKEY_MODE=push_to_talk I_ACCEPT_INPUT_GROUP=1 ./install.sh
 # log out and back in when it says so, then ./install.sh again
 ```
 
-The installer is idempotent, pins every version, verifies SHA256 (and GPG for Voxtype), and never pipes the network into a shell. `./install.sh --list` shows the steps; pass names to re-run a subset.
+The installer is idempotent, pins every version **and digest**, requires a valid GPG signature for Voxtype, and never pipes the network into a shell. `./install.sh --list` shows the steps; pass names to re-run a subset. The mode you chose is remembered in `~/.config/dictate/hotkey_mode`, so plain `./install.sh` re-runs keep it. `SECURITY_REVIEW.md` documents the threat model and the reasoning behind these choices.
 
-Before the first dictation, remap a spare physical key to **F13** in your keyboard's firmware tool (VIA/QMK). It must be a non-modifier key — INSTALL.md §5 explains why.
+Before the first dictation: in toggle mode (default), add a COSMIC custom shortcut — Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts — running `/home/<you>/.local/bin/voxtype record toggle`, bound to a modifier combo such as Super+Space (COSMIC's picker usually refuses a bare key like F13; INSTALL.md Step 5 has the file-based workaround). For push-to-talk, remap a spare physical key to **F13** in the keyboard firmware (VIA/QMK); it must be a non-modifier key — INSTALL.md §5 explains why.
 
 ## Daily use
 
-- Hold F13, speak, release.
+- Toggle mode (default): press your COSMIC shortcut, speak, press it again. Push-to-talk: hold F13, speak, release. Press Esc while holding to cancel without pasting.
+- Turn it off / on: `systemctl --user stop voxtype` / `start`; `disable --now` keeps it off across logins, `enable --now` restores it. Nothing else is running in the foreground — the daemon is a systemd user service. Ollama is a separate system service (`sudo systemctl stop ollama`) that idles at zero CPU.
+- Spoken "new line" / "new paragraph" are flattened to spaces unless `"allow_newlines": true` is set (see Settings). Terminals never receive newlines, whatever the setting.
 - Misheard word: `dictate fix "what it heard" "What you meant"`. Spelling/capitalization the LLM should know: `dictate jargon "PipeWire"`. Snippet: `dictate snippet "my address" "123 Main St"`.
 - See what happened: `dictate log tail 10` (shows `raw -> final` when they differ), `dictate log stats`, `journalctl --user -u voxtype -f`.
 - Dry-run without the mic: `dictate test "send it monday actually delete that send it friday"`.
 - Tune LLM behavior: add `Raw: … / Clean: …` pairs to `~/.config/dictate/prompt.md`; they are sent to the model as demonstrations.
-- Privacy: the log holds every dictation in plaintext (mode 600). `dictate log purge` deletes it; `"log_text": false` in `~/.config/dictate/settings.json` keeps only metadata.
+- Privacy: the log is metadata-only by default. `"log_text": true` in `~/.config/dictate/settings.json` records every dictation in plaintext (mode 600) so you can tune the dictionary and prompt; `dictate log purge` deletes it. Note that every dictation also passes through the Wayland clipboard, so a clipboard-history tool keeps its own copy.
 - **Not in COSMIC Terminal.** It pastes only on Ctrl+Shift+V and ignores Shift+Insert, and no single chord works in both terminals and GTK/Electron apps. Alacritty, kitty and foot honour Shift+Insert if you want terminal dictation.
 
 ## The `dictate` command
 
-`dictate` is a small Python CLI (symlinked to `~/.local/bin/dictate`) that edits the data files `polish.py` reads and inspects what it did. Nothing it changes needs a restart: `polish.py` re-reads the files on every dictation, so a fix takes effect on the very next one.
+`dictate` is a small Python CLI (installed as a copy in `~/.local/bin/dictate`; re-run `./install.sh config` after editing it, or use `DEV_SYMLINK=1` while developing) that edits the data files `polish.py` reads and inspects what it did. Nothing it changes needs a restart: `polish.py` re-reads the files on every dictation, so a fix takes effect on the very next one.
 
 | Command | What it does | Writes to |
 |---|---|---|
@@ -141,13 +145,30 @@ Three findings from getting this working on COSMIC, each documented in INSTALL.m
 | Length guard | ±40 % | Asymmetric: growth > 30 % or shrink > 75 % rejected. Self-corrections legitimately shrink text ~50–70 %. |
 | Few-shot examples | prose in the system prompt | Sent as real user/assistant turns; an 8B model imitates demonstrations far better than it follows descriptions. |
 | Hotkey | TBD | F13 (see above). |
-| Installs | latest release, `curl \| sh` | Pinned versions, SHA256 + GPG verified, Ollama bound to `127.0.0.1` under its own system user. |
-| Hotkey privilege | `input` group | Default for push-to-talk; `HOTKEY_MODE=toggle` variant needs only a `uinput` group. INSTALL.md §1.2. |
-| Dictation log | plaintext, forever | Mode 600, `log_text`/`log_enabled` settings, `dictate log purge`. |
+| Installs | latest release, `curl \| sh` | Pinned versions **and digests** (tarball sha256, git commit, model blob, every Parakeet file), GPG signature required for Voxtype, Ollama bound to `127.0.0.1` under its own sandboxed system user. |
+| Hotkey privilege | `input` group | Toggle mode is the default (`uinput` group only). Push-to-talk needs `input` and an explicit `I_ACCEPT_INPUT_GROUP=1`. INSTALL.md §1.2. |
+| Dictation log | plaintext, forever | Metadata-only by default; `log_text`/`log_enabled` settings, mode 600, `dictate log purge`. |
+| Pasted text | whatever the LLM returned | Control characters stripped; newlines off unless `allow_newlines`, never in terminals. |
+
+## Settings
+
+`~/.config/dictate/settings.json` overrides the defaults in `polish.py`. All keys are optional.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `allow_newlines` | `false` | Keep newlines that the LLM produces from "new line" / "new paragraph". Off by default so a transcript — yours, or a video playing while the mic is on — can never press Enter for you. A terminal-style target never receives newlines, even when this is `true`. |
+| `log_enabled` / `log_text` | `true` / `false` | Write a log line per dictation / include the raw and final text in it. |
+| `ollama_url` | `http://localhost:11434/api/chat` | Must be a loopback address (`localhost`, `127.0.0.1`, `::1`) over plain `http`; anything else is rejected and dictation falls back to the uncleaned text. Every dictation is POSTed here, so this setting must never be able to point off-machine. |
+| `model`, `temperature`, `think`, `llm_timeout_s` | `qwen3:8b`, `0.1`, `false`, `4.0` | LLM call parameters. |
+| `min_words_for_llm` | `6` | Shorter dictations skip the LLM (dictionary only). |
+| `max_growth` / `max_shrink` | `0.30` / `0.75` | Length guard: LLM output longer by more than 30 % or shorter by more than 75 % is discarded. |
+| `app_id_max_age_s` | `5.0` | How fresh `~/.config/dictate/app_id` must be to count. |
+
+Control characters (ESC, BEL, NUL, …) are always stripped from the output before it is pasted, on every path including the crash fallback.
 
 ## Verification
 
-- Unit: `pytest -q tests/` — 22 tests, LLM mocked (U1–U10 from the handoff plus edge cases and log privacy).
+- Unit: `pytest -q tests/` — 37 tests, LLM mocked (U1–U10 from the handoff, edge cases, log privacy, and the S-series from `SECURITY_REVIEW.md`: output sanitization, loopback-only `ollama_url`, literal correction values).
 - Integration (handoff §7.2): passed 2026-09-02 — paste in four apps, clipboard image restored, silent release pastes nothing, 30 s dictation intact.
 - Latency (§7.3): after ~20 dictations, `dictate log stats`. Early numbers: Parakeet 0.13–0.21 s, LLM path 55–700 ms. If over budget: `qwen3:4b` in `settings.json`, shorter `prompt.md`.
 - Accuracy (§7.4) and safety (§7.5): as in the handoff; re-run `dictate test` cases after prompt or dictionary changes.

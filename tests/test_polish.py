@@ -153,7 +153,8 @@ def test_u10_end_to_end_logs_one_line(cfgdir, tmp_path):
                VOXTYPE_CONTEXT="")
     # settings point at a closed port so the real script exercises the fallback path
     s = json.loads((cfgdir / "settings.json").read_text())
-    s.update({"ollama_url": "http://127.0.0.1:9/api/chat", "llm_timeout_s": 0.5})
+    s.update({"ollama_url": "http://127.0.0.1:9/api/chat", "llm_timeout_s": 0.5,
+              "log_text": True})   # shipped default is metadata-only; this test checks the text fields
     (cfgdir / "settings.json").write_text(json.dumps(s))
 
     out = subprocess.run([sys.executable, str(ROOT / "polish.py")],
@@ -168,6 +169,11 @@ def test_u10_end_to_end_logs_one_line(cfgdir, tmp_path):
                           "latency_ms", "words"}
     assert entry["llm_used"] is False and entry["reason"].startswith("llm_error")
     assert oct(log.stat().st_mode & 0o777) == "0o600"
+
+
+def test_shipped_settings_default_to_metadata_only_log():
+    assert json.loads((ROOT / "config" / "settings.json").read_text())["log_text"] is False
+    assert polish.DEFAULT_SETTINGS["log_text"] is False
 
 
 def test_log_text_off_keeps_only_metadata(cfgdir, tmp_path):
@@ -228,3 +234,72 @@ def test_split_examples_tolerates_quotes_and_missing_block():
     sys_, ex = polish.split_examples('Rules.\n\nExamples:\nRaw: "a b"\nClean: "A b."\n')
     assert sys_ == "Rules." and ex == [("a b", "A b.")]
     assert polish.split_examples("Just rules.") == ("Just rules.", [])
+
+
+# S1 — output sanitization (security review M1) ------------------------------
+ESC_PAYLOAD = "ok\x1b]0;pwned\x07 fine\x1b[31m\r\x00 done"
+
+
+def test_s1_control_chars_stripped_on_every_path(cfg):
+    # LLM path
+    src = "please deploy the new build to staging tonight"
+    r = polish.polish(src, cfg, llm=FakeLLM(reply="Please deploy \x1b]52;c;cHduZWQ=\x07tonight."))
+    assert "\x1b" not in r.final and "\x07" not in r.final and r.llm_used
+    # short path
+    r = polish.polish("hi\x1b[2Jthere", cfg, llm=FakeLLM())
+    assert r.final == "hi[2Jthere"          # ESC gone: the residue is inert printable text
+    # snippet path: the expansion itself is sanitized
+    cfg.snippets["boom"] = "a\x1bb\nc"
+    assert polish.polish("boom", cfg, llm=FakeLLM()).final == "ab c"
+    # unit
+    assert polish.sanitize_output(ESC_PAYLOAD, allow_newlines=False) == "ok]0;pwned fine[31m done"
+
+
+def test_s1b_newlines_off_by_default_on_by_setting_never_in_terminal(cfg):
+    llm = FakeLLM(reply="First line.\nSecond line.")
+    src = "first line new line second line ok"
+    assert polish.polish(src, cfg, llm=llm).final == "First line. Second line."
+    cfg.settings["allow_newlines"] = True
+    assert polish.polish(src, cfg, llm=llm).final == "First line.\nSecond line."
+    assert polish.polish(src, cfg, app_id="Alacritty", llm=llm).final == "First line. Second line."
+    assert polish.DEFAULT_SETTINGS["allow_newlines"] is False
+
+
+def test_s1c_crash_fallback_is_sanitized(cfgdir, tmp_path):
+    (cfgdir / "settings.json").write_text('{"llm_timeout_s": "not a number"}')  # forces the crash path
+    env = dict(os.environ, DICTATE_CONFIG_DIR=str(cfgdir), DICTATE_LOG=str(tmp_path / "l.jsonl"))
+    out = subprocess.run([sys.executable, str(ROOT / "polish.py")],
+                         input="hello \x1b]0;x\x07 there\n", capture_output=True, text=True,
+                         env=env, timeout=10)
+    assert out.returncode == 0 and out.stdout == "hello ]0;x there"
+
+
+# S2 — ollama_url must be loopback (M2) ----------------------------------------
+@pytest.mark.parametrize("url", ["http://localhost:11434/api/chat", "http://127.0.0.1:11434/api/chat",
+                                 "http://[::1]:11434/api/chat"])
+def test_s2_loopback_urls_accepted(url):
+    assert polish.validate_ollama_url(url) == url
+
+
+@pytest.mark.parametrize("url", ["https://localhost:11434/api/chat", "http://evil.example/api/chat",
+                                 "http://127.0.0.1.evil.example/x", "http://10.0.0.5:11434/api/chat",
+                                 "file:///etc/passwd", ""])
+def test_s2b_non_loopback_urls_rejected(url):
+    with pytest.raises(ValueError):
+        polish.validate_ollama_url(url)
+
+
+def test_s2c_bad_url_in_settings_falls_back_to_raw_text(cfgdir, tmp_path):
+    (cfgdir / "settings.json").write_text('{"ollama_url": "http://evil.example/api/chat"}')
+    env = dict(os.environ, DICTATE_CONFIG_DIR=str(cfgdir), DICTATE_LOG=str(tmp_path / "l.jsonl"))
+    out = subprocess.run([sys.executable, str(ROOT / "polish.py")],
+                         input="one two three four five six seven", capture_output=True,
+                         text=True, env=env, timeout=10)
+    assert out.returncode == 0 and out.stdout == "one two three four five six seven"
+
+
+# S3 — corrections are literal replacements (L5) -------------------------------
+def test_s3_correction_values_are_literal_and_empty_keys_ignored():
+    c = {"i get committed": r"git commit \1 \g<x> \\", "": "X"}
+    assert polish.apply_corrections("i get committed now", c) == r"git commit \1 \g<x> \\ now"
+    assert polish.apply_corrections("hello world", {"": "X"}) == "hello world"

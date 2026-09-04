@@ -20,6 +20,13 @@ Checking:
                                          dictation in plaintext until you do
   dictate app "<app_id>"                 write a focused-app hint (for a future focus helper)
 
+Settings (~/.config/dictate/settings.json, all optional — see README "Settings"):
+  "allow_newlines": false   keep newlines ("new line" / "new paragraph") in the pasted text.
+                            Off by default so a transcript can never press Enter for you;
+                            a terminal never gets newlines even when this is true.
+  "log_text": false         store raw/final text in the log (off = metadata only)
+  "ollama_url"              must be a loopback address; anything else is rejected
+
 Where a mistake came from (dictate log tail):
   raw already wrong  -> ASR misheard        -> dictate fix
   raw right, final wrong -> LLM respelled   -> dictate jargon, then a Raw:/Clean: example in prompt.md
@@ -126,7 +133,11 @@ def cmd_log(args):
             shown = f"{raw!r} -> {final!r}" if raw is not None and raw.strip() != final.strip() else repr(final)
             print(f"{e['ts']}  {e['latency_ms']:5d}ms  {e['reason']:<14} {shown}")
     elif sub == "stats":
-        subprocess.run([sys.executable, str(HERE / "tests" / "latency_report.py"), str(p)], check=False)
+        # installed as a copy next to this script by install.sh; falls back to the repo layout
+        report = HERE / "dictate_latency_report.py"
+        if not report.exists():
+            report = HERE / "tests" / "latency_report.py"
+        subprocess.run([sys.executable, str(report), str(p)], check=False)
     elif sub == "purge":
         p.unlink()
         print(f"deleted {p} ({len(lines)} entries)")
