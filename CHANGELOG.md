@@ -7,6 +7,8 @@ names the commit or PR so a change can be found and reverted with `git revert <s
 
 (The scheduled improvement agent adds one line here per merged step — see `AGENTS.md`.)
 
+- [PR #3] `2e5f14c` CI: GitHub Actions runs `pytest -q tests/`, `bash -n install.sh`, `shellcheck -S warning install.sh` and byte-compiles every Python entry point on every push and pull request; badge in README. (roadmap step 1)
+
 ## v1.0 — 2026-09-03
 
 First tagged release. Working daily driver on Pop!_OS 24.04 + COSMIC (Wayland),
