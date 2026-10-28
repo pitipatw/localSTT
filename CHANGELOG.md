@@ -11,6 +11,8 @@ names the commit or PR so a change can be found and reverted with `git revert <s
 
 - [PR #4] `c054fa1` feat: screen-edge recording indicator (`docs/feature-requests/01`) — a border on every monitor while the mic is open, Voxtype state file and a PipeWire poll as independent sources, amber pulse before the 60 s cap; new `indicator` installer step and `dictate-indicator` user unit. Includes a `~/.local/lib` gtk4-layer-shell discovery fix and the ydotool 1.x keycode correction to the INSTALL.md paste probes.
 
+- [issue #6] fix: `dictate-indicator` replaces its 500 ms `pw-dump` poll with one long-lived `pw-dump --monitor`; idle CPU ~2.3 % → ~0.03 %, and no more ~1.9 new PipeWire clients and session-bus connections per second. (roadmap step 14)
+
 ## v1.0 — 2026-09-03
 
 First tagged release. Working daily driver on Pop!_OS 24.04 + COSMIC (Wayland),
