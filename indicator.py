@@ -10,9 +10,10 @@ check the mic (`pw-top`). It shows state only; it never sees the transcript.
 Sources of truth, combined with OR (either one lights the glow):
   1. Voxtype's state file ($XDG_RUNTIME_DIR/voxtype/state, written by the daemon
      with state_file = "auto"): "recording" / "streaming" mean the mic is open.
-  2. PipeWire: `pw-dump` lists a running Stream/Input/Audio node owned by the
-     `voxtype` binary. This is ground truth independent of Voxtype's bookkeeping
-     and costs one short subprocess per poll (off with --pipewire-poll-ms 0).
+  2. PipeWire: the graph holds a running Stream/Input/Audio node owned by the
+     `voxtype` binary. This is ground truth independent of Voxtype's bookkeeping.
+     One long-lived `pw-dump --monitor` streams graph changes, so the check costs
+     one PipeWire client for the life of the process (off with --pipewire-poll-ms 0).
 
 The border turns from green to a pulsing amber for the last --warn-secs before
 Voxtype's own hard cap ([audio] max_duration_secs) stops the recording.
@@ -45,8 +46,9 @@ DEFAULT_MAX_SECS = 60           # Voxtype's [audio] max_duration_secs default
 DEFAULT_WARN_SECS = 10
 DEFAULT_BORDER_PX = 6
 STATE_POLL_MS = 100
-PIPEWIRE_POLL_MS = 500
+PIPEWIRE_POLL_MS = 500         # CLI compatibility only: 0 disables the PipeWire source
 PW_DUMP_TIMEOUT_S = 2.0
+MONITOR_RESTART_S = 5.0        # wait before restarting a pw-dump --monitor that exited
 
 
 # ---- pure logic (unit-tested, no GTK) -------------------------------------
@@ -135,15 +137,53 @@ class Tracker:
         return self.phase
 
 
-# ---- PipeWire poller (background thread, no GTK) ---------------------------
+class GraphMonitor:
+    """Folds `pw-dump --monitor` output into the current set of nodes. The stream is a
+    sequence of top-level JSON arrays: the whole graph first, then one array per change,
+    where {"id": N, "info": null} means object N was removed. pw-dump puts each top-level
+    closing bracket at the start of its own line, which is where a document ends."""
+
+    def __init__(self):
+        self.nodes: dict = {}
+        self._lines: list[str] = []
+
+    def feed_line(self, line: str) -> bool:
+        """Consume one line of output; True when it completed a document."""
+        self._lines.append(line)
+        if not (line.startswith("]") or line.rstrip() == "[]"):
+            return False
+        text, self._lines = "".join(self._lines), []
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            return False
+        if not isinstance(doc, list):
+            return False
+        for obj in doc:
+            if not isinstance(obj, dict) or "id" not in obj:
+                continue
+            if obj.get("info") is None:
+                self.nodes.pop(obj["id"], None)
+            elif obj.get("type") == "PipeWire:Interface:Node":
+                self.nodes[obj["id"]] = obj
+        return True
+
+    def active(self, binary: str = "voxtype") -> bool:
+        return pipewire_capture_active(list(self.nodes.values()), binary)
+
+
+# ---- PipeWire watcher (background thread, no GTK) ---------------------------
 class PipeWireWatcher:
-    """Polls `pw-dump` on a thread and exposes the last answer. A missing pw-dump or a
-    timeout reads as "not active" so the state file remains the only source."""
+    """Runs one `pw-dump --monitor` on a thread and exposes whether voxtype is capturing.
+    Polling `pw-dump` instead costs a new PipeWire client and a new session-bus connection
+    per poll, and every one is broadcast to the whole desktop (issue #6). A missing pw-dump,
+    or a monitor that exited, reads as "not active" so the state file remains the only source."""
 
     def __init__(self, interval_ms: int, binary: str = "voxtype"):
-        self.interval_s = interval_ms / 1000.0
+        self.enabled = interval_ms > 0
         self.binary = binary
         self._active = False
+        self._proc: subprocess.Popen | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="pw-dump", daemon=True)
 
@@ -152,18 +192,47 @@ class PipeWireWatcher:
         return self._active
 
     def start(self) -> None:
-        if self.interval_s > 0:
+        if self.enabled:
             self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self._active = self.query()
-            self._stop.wait(self.interval_s)
+            self._monitor()
+            self._active = False
+            self._stop.wait(MONITOR_RESTART_S)
+
+    def _monitor(self) -> None:
+        """One pw-dump --monitor lifetime; returns when it exits (e.g. PipeWire restarted)."""
+        try:
+            proc = subprocess.Popen(["pw-dump", "--monitor", "--no-colors"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            return
+        self._proc = proc
+        with proc:   # closes the pipe and reaps the child on every exit path
+            graph = GraphMonitor()
+            try:
+                for line in proc.stdout:
+                    if self._stop.is_set():
+                        break
+                    if graph.feed_line(line):
+                        self._active = graph.active(self.binary)
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=PW_DUMP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
     def query(self) -> bool:
+        """One-shot snapshot via plain `pw-dump`; the running watcher does not use it."""
         try:
             out = subprocess.run(["pw-dump"], capture_output=True, text=True,
                                  timeout=PW_DUMP_TIMEOUT_S, check=False).stdout
@@ -359,7 +428,7 @@ def run_overlay(args) -> int:
     app = Gtk.Application(application_id="io.github.localstt.indicator")
     app.connect("activate", on_activate)
     _log(f"watching {args.state_file} (max {args.max_secs}s, warn {args.warn_secs}s, "
-         f"pipewire poll {args.pipewire_poll_ms}ms)")
+         f"pipewire monitor {'on' if args.pipewire_poll_ms > 0 else 'off'})")
     return app.run([])
 
 
@@ -394,7 +463,8 @@ def parse_args(argv):
     p.add_argument("--width", type=int, default=DEFAULT_BORDER_PX, help="border width in px")
     p.add_argument("--poll-ms", type=int, default=STATE_POLL_MS, help="state file poll interval")
     p.add_argument("--pipewire-poll-ms", type=int, default=PIPEWIRE_POLL_MS,
-                   help="pw-dump poll interval; 0 disables the PipeWire cross-check")
+                   help="0 disables the PipeWire cross-check; any other value enables it "
+                        "(name kept for compatibility: the check is a pw-dump --monitor, not a poll)")
     p.add_argument("--demo", type=float, default=0, metavar="SECS",
                    help="show the glow for SECS seconds regardless of state (paste-through test)")
     p.add_argument("--check", action="store_true", help="verify the graphics stack and exit")

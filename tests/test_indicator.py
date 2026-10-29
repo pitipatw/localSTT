@@ -1,9 +1,10 @@
-"""Unit tests for indicator.py — the state logic only; no GTK, no Wayland, no pw-dump.
+"""Unit tests for indicator.py — the state logic only; no GTK, no Wayland, no real pw-dump.
 Run: pytest -q tests/"""
 
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,85 @@ def test_i5_pipewire_watcher_without_pw_dump_is_inactive(monkeypatch):
     w.start()   # interval 0: no thread, no crash
     w.stop()
 
+
+
+# I7 PipeWire monitor stream (issue #6) -------------------------------------
+def monitor_lines(*docs):
+    """Lines as `pw-dump --monitor` prints them: indented JSON arrays, brackets at column 0."""
+    return [line + "\n" for doc in docs for line in json.dumps(doc, indent=2).split("\n")]
+
+
+def feed(graph, *docs):
+    return [graph.feed_line(line) for line in monitor_lines(*docs)].count(True)
+
+
+def test_i7_monitor_initial_dump_then_state_changes():
+    g = indicator.GraphMonitor()
+    node = dict(pw_node(state="suspended"), id=89)
+    client = {"id": 95, "type": "PipeWire:Interface:Client", "info": {"props": {}}}
+    assert feed(g, [node, client]) == 1
+    assert g.active() is False and set(g.nodes) == {89}     # only nodes are kept
+    assert feed(g, [dict(pw_node(state="running"), id=89)]) == 1
+    assert g.active() is True
+    assert feed(g, [dict(pw_node(state="idle"), id=89)]) == 1
+    assert g.active() is False
+
+
+def test_i7_monitor_removal_clears_capture():
+    g = indicator.GraphMonitor()
+    feed(g, [dict(pw_node(), id=89)])
+    assert g.active() is True
+    feed(g, [{"id": 95, "info": None}])                      # unrelated removal
+    assert g.active() is True
+    feed(g, [{"id": 89, "info": None}])
+    assert g.active() is False and g.nodes == {}
+
+
+def test_i7_monitor_survives_garbage_and_empty_documents():
+    g = indicator.GraphMonitor()
+    assert g.feed_line("[\n") is False
+    assert g.feed_line("  {not json\n") is False
+    assert g.feed_line("]\n") is False and g.nodes == {}    # broken document is dropped
+    assert g.feed_line("[]\n") is True                       # empty one-line document
+    assert feed(g, [1, "x", {"no": "id"}, dict(pw_node(), id=7)]) == 1
+    assert g.active() is True
+
+
+def test_i7_watcher_starts_one_monitor_not_a_poll(tmp_path, monkeypatch):
+    """The fix itself: one long-lived pw-dump for the whole run, not one per poll."""
+    calls = tmp_path / "calls"
+    script = tmp_path / "pw-dump"
+    doc = json.dumps([dict(pw_node(), id=89)], indent=2)
+    script.write_text(f"#!{sys.executable}\n"
+                      "import sys, time\n"
+                      f"open({str(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                      f"print({doc!r}, flush=True)\n"
+                      "time.sleep(30)\n")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    w = indicator.PipeWireWatcher(interval_ms=indicator.PIPEWIRE_POLL_MS)
+    w.start()
+    try:
+        for _ in range(100):
+            if w.active:
+                break
+            time.sleep(0.02)
+        assert w.active is True
+        time.sleep(1.2)          # the old watcher would have run pw-dump twice more by now
+        assert calls.read_text().splitlines() == ["--monitor --no-colors"]
+    finally:
+        w.stop()
+    w._thread.join(timeout=5)
+    assert not w._thread.is_alive() and w._proc.poll() is not None   # child reaped
+
+
+def test_i7_watcher_without_pw_dump_stays_inactive(monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    w = indicator.PipeWireWatcher(interval_ms=indicator.PIPEWIRE_POLL_MS)
+    w.start()
+    time.sleep(0.1)
+    assert w.active is False
+    w.stop()
 
 # I6 library / typelib discovery --------------------------------------------
 def test_i6_explicit_override_is_tried_first():
